@@ -8,7 +8,7 @@ source.include_exts = py,png,jpg,kv,atlas
 
 version = 1.0
 
-requirements = python3==3.11.9,kivy==2.2.1,kivymd==1.1.1,supabase,plyer,certifi,httpx,websockets,pydantic,pyjnius,Cython==0.29.37
+requirements = python3,kivy==2.2.1,kivymd==1.1.1,supabase,plyer,certifi,httpx,websockets,pydantic,pyjnius
 
 orientation = portrait
 fullscreen = 0
@@ -21,8 +21,8 @@ warn_on_root = 1
 android.permissions = INTERNET, ACCESS_NETWORK_STATE, POST_NOTIFICATIONS
 android.api = 33
 android.minapi = 24
-android.ndk = 25b
+android.ndk = 28c
 android.archs = arm64-v8a
 android.accept_sdk_license = True
-
-p4a.branch = master
+android.ndk_path = /usr/local/lib/android/sdk/ndk/28.3.13750724
+android.sdk_path = /usr/local/lib/android/sdk
