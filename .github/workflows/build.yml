@@ -28,31 +28,25 @@ jobs:
         run: |
           sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 2
           sudo update-alternatives --set python3 /usr/bin/python3.11
+          sudo update-alternatives --install /usr/bin/python python /usr/bin/python3.11 2
+          sudo update-alternatives --set python /usr/bin/python3.11
+          sudo rm -f /usr/bin/python3.14 || true
           curl -sS https://bootstrap.pypa.io/get-pip.py | sudo python3.11
           python3 --version
 
-      - name: Instalar Buildozer
+      - name: Instalar Buildozer e p4a
         run: |
+          pip3 install --upgrade pip setuptools wheel
           pip3 install buildozer==1.5.0 "Cython==0.29.37"
-
-      - name: Verificar NDK disponível
-        run: |
-          ls /usr/local/lib/android/sdk/ndk/ || echo "NDK não encontrado"
-          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          pip3 install python-for-android==2024.1.21
 
       - name: Cache Buildozer
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: nexus-v8-${{ hashFiles('buildozer.spec') }}
+          key: nexus-v9-${{ hashFiles('buildozer.spec') }}
 
       - name: Build APK
-        env:
-          ANDROIDSDK: /usr/local/lib/android/sdk
-          ANDROIDNDK: /usr/local/lib/android/sdk/ndk/28.3.13750724
-          ANDROIDAPI: "33"
-          ANDROIDMINAPI: "24"
         run: |
           export PATH=$PATH:~/.local/bin
           yes | buildozer -v android debug 2>&1 | tail -400
