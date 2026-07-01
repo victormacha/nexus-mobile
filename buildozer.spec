@@ -8,7 +8,7 @@ source.include_exts = py,png,jpg,kv,atlas
 
 version = 1.0
 
-requirements = python3==3.11.9,kivy==2.2.1,kivymd==1.1.1,supabase,plyer,certifi,httpx,websockets,pydantic,pyjnius
+requirements = python3,kivy==2.2.1,kivymd==1.1.1,supabase,plyer,certifi,httpx,websockets,pydantic,pyjnius
 
 orientation = portrait
 fullscreen = 0
@@ -25,4 +25,3 @@ android.ndk = 25b
 android.archs = arm64-v8a
 android.accept_sdk_license = True
 p4a.branch = v2024.01.21
-p4a.python_version = 3.11.9
