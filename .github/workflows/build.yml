@@ -23,13 +23,13 @@ jobs:
             zlib1g-dev libncurses5-dev libncursesw5-dev \
             cmake libffi-dev libssl-dev aidl ccache
           pip install --upgrade pip setuptools wheel
-          pip install buildozer==1.5.0 "Cython==0.29.37"
+          pip install buildozer==1.5.0 "Cython==3.0.11"
 
       - name: Cache Buildozer
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: nexus-v14-${{ hashFiles('buildozer.spec') }}
+          key: nexus-v15-${{ hashFiles('buildozer.spec') }}
 
       - name: Build APK
         run: |
