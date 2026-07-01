@@ -26,7 +26,7 @@ jobs:
             aidl ccache \
             python3.11 python3.11-dev python3.11-venv
 
-      - name: Configurar Python 3.11
+      - name: Configurar Python 3.11 como padrão
         run: |
           sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 2
           sudo update-alternatives --set python3 /usr/bin/python3.11
@@ -34,30 +34,30 @@ jobs:
           sudo update-alternatives --set python /usr/bin/python3.11
           curl -sS https://bootstrap.pypa.io/get-pip.py | sudo python3.11
           python3 --version
-          pip3 --version
 
       - name: Instalar Buildozer
         run: |
           pip3 install --upgrade pip setuptools wheel
           pip3 install buildozer==1.5.0 "Cython==0.29.37"
 
+      # Cache com chave nova para forçar rebuild limpo
       - name: Cache Android SDK/NDK
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: buildozer-${{ runner.os }}-py311-v6-${{ hashFiles('buildozer.spec') }}
-          restore-keys: buildozer-${{ runner.os }}-py311-v6-
+          key: buildozer-clean-v7-${{ hashFiles('buildozer.spec') }}
 
       - name: Build APK
         run: |
           export PATH=$PATH:~/.local/bin
-          yes | buildozer -v android debug 2>&1 | tail -300
+          yes | buildozer -v android debug 2>&1 | tail -400
 
       - name: Listar bin/
         if: always()
         run: ls -la bin/ 2>/dev/null || echo "bin/ nao encontrada"
 
       - name: Upload APK
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Nexus-debug.apk
