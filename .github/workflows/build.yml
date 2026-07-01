@@ -29,8 +29,7 @@ jobs:
             autoconf libtool pkg-config \
             zlib1g-dev libncurses5-dev libncursesw5-dev \
             cmake libffi-dev libssl-dev \
-            aidl \
-            ccache
+            aidl ccache
 
       - name: Instalar Buildozer e Cython
         run: |
@@ -41,9 +40,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-${{ runner.os }}-ndk25b-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-${{ runner.os }}-
+            buildozer-${{ runner.os }}-ndk25b-
 
       - name: Build APK
         run: |
