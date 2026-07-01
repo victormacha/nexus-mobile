@@ -29,7 +29,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: nexus-v12-${{ hashFiles('buildozer.spec') }}
+          key: nexus-v13-${{ hashFiles('buildozer.spec') }}
 
       - name: Build APK
         run: |
