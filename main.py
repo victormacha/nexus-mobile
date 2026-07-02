@@ -31,9 +31,8 @@ from kivymd.uix.menu import MDDropdownMenu
 from kivymd.uix.pickers import MDDatePicker, MDTimePicker
 from kivymd.uix.dialog import MDDialog
 from kivymd.uix.snackbar import Snackbar
-from kivymd.uix.segmentedbutton import MDSegmentedButton, MDSegmentedButtonItem
 
-from supabase import create_client, Client
+from supabase_shim import sb
 
 # Notificações locais (Android / iOS / desktop p/ testes)
 try:
@@ -43,12 +42,9 @@ except Exception:
     PLYER_OK = False
 
 # ── Supabase ─────────────────────────────────────────────────────────
-# IMPORTANTE: troque para a chave "anon" pública (não a "service_role"/secret)
-# antes de distribuir este app, e configure as políticas de RLS no Supabase.
-# A secret key NUNCA deve ir dentro de um app instalável.
-SUPABASE_URL = "https://xieghxptvcwkcugunxib.supabase.co"
-SUPABASE_KEY = "sb_publishable_c4RjoRWAJXPajevlGY5Awg_5NWU1f7n"
-sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# O cliente "sb" agora vem do supabase_shim.py (não muda em nada o resto
+# do código: sb.table(...).select()/.eq()/.insert()/.execute() etc.
+# continuam funcionando exatamente igual).
 
 # ── Helpers ───────────────────────────────────────────────────────────
 def hash_senha(s: str) -> str:
