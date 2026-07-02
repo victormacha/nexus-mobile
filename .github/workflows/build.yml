@@ -1,49 +1,50 @@
-name: Build APK — Nexus
+name: Build APK
 
 on:
+  workflow_dispatch:      # permite rodar manualmente pelo botão "Run workflow"
   push:
-    branches: [ main ]
-  workflow_dispatch:
+    branches: [main]
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
-
     steps:
-      - name: Checkout
+      - name: Checkout do código
         uses: actions/checkout@v4
 
-      - name: Instalar dependências
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y \
-            git zip unzip openjdk-17-jdk \
-            autoconf libtool pkg-config \
-            zlib1g-dev libncurses5-dev libncursesw5-dev \
-            cmake libffi-dev libssl-dev aidl ccache
-          pip install --upgrade pip setuptools wheel
-          pip install buildozer==1.5.0 "Cython==3.0.11"
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Cache Buildozer
+      - name: Instalar dependências de sistema (necessárias pro p4a compilar)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git zip unzip openjdk-17-jdk python3-pip autoconf libtool \
+            pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev \
+            cmake libffi-dev libssl-dev automake build-essential \
+            libltdl-dev
+
+      - name: Instalar buildozer e Cython
+        run: |
+          pip install --upgrade pip
+          pip install buildozer cython==0.29.36
+
+      - name: Cache do buildozer (acelera builds futuros)
         uses: actions/cache@v4
         with:
-          path: ~/.buildozer
-          key: nexus-v15-${{ hashFiles('buildozer.spec') }}
+          path: |
+            .buildozer
+            ~/.buildozer
+          key: buildozer-${{ hashFiles('buildozer.spec') }}
 
-      - name: Build APK
+      - name: Gerar APK
         run: |
-          export PATH=$PATH:~/.local/bin
-          yes | buildozer -v android debug 2>&1 | tail -400
+          yes | buildozer android debug
 
-      - name: Listar bin/
-        if: always()
-        run: ls -la bin/ 2>/dev/null || echo "bin/ nao encontrada"
-
-      - name: Upload APK
-        if: always()
+      - name: Subir o APK como artefato
         uses: actions/upload-artifact@v4
         with:
-          name: Nexus-debug.apk
+          name: nexus-apk
           path: bin/*.apk
-          if-no-files-found: warn
