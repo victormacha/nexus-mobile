@@ -2,13 +2,15 @@
 title = Nexus
 package.name = nexus
 package.domain = org.nexusapp
-
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
-
 version = 1.0
 
-requirements = python3,kivy==2.2.1,kivymd==1.1.1,supabase,plyer,certifi,httpx,websockets,pydantic,pyjnius
+# ── MUDANÇA PRINCIPAL ──────────────────────────────────────────────
+# Removidos: supabase, httpx, websockets, pydantic
+# (essas libs não compilam pro Android — pydantic-core é Rust e trava o p4a)
+# Adicionado: requests (usado pelo supabase_shim.py, compila sem problema)
+requirements = python3,kivy==2.2.1,kivymd==1.1.1,requests,plyer,certifi,pyjnius
 
 orientation = portrait
 fullscreen = 0
