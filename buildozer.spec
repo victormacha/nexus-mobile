@@ -10,7 +10,12 @@ version = 1.0
 # Removidos: supabase, httpx, websockets, pydantic
 # (essas libs não compilam pro Android — pydantic-core é Rust e trava o p4a)
 # Adicionado: requests (usado pelo supabase_shim.py, compila sem problema)
-requirements = python3,kivy==2.2.1,kivymd==1.1.1,requests,plyer,certifi,pyjnius
+#
+# python3==3.11.9 / hostpython3==3.11.9: trava a versão do Python usada
+# pra COMPILAR o app pro Android. Sem isso, o buildozer pega a versão
+# mais nova do Python (3.14), que não é compatível com o Cython antigo
+# que o Kivy 2.2.1 precisa (dá erro "No module named 'cgi'").
+requirements = python3==3.11.9,hostpython3==3.11.9,kivy==2.2.1,kivymd==1.1.1,requests,plyer,certifi,pyjnius
 
 orientation = portrait
 fullscreen = 0
