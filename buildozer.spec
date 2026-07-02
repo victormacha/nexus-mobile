@@ -12,10 +12,13 @@ version = 1.0
 # Adicionado: requests (usado pelo supabase_shim.py, compila sem problema)
 #
 # python3==3.11.9 / hostpython3==3.11.9: trava a versão do Python usada
-# pra COMPILAR o app pro Android. Sem isso, o buildozer pega a versão
-# mais nova do Python (3.14), que não é compatível com o Cython antigo
-# que o Kivy 2.2.1 precisa (dá erro "No module named 'cgi'").
-requirements = python3==3.11.9,hostpython3==3.11.9,kivy==2.2.1,kivymd==1.1.1,requests,plyer,certifi,pyjnius
+# pra COMPILAR o app pro Android (resolve erro do Cython/"cgi").
+#
+# kivy / kivymd SEM "==versão": travar a versão fazia o buildozer procurar
+# um pacote pré-compilado (wheel) pro Android que não existe pra 2.2.1,
+# e ele falhava em vez de compilar do zero. Sem a trava, ele compila
+# a versão padrão do zero, que é o caminho mais confiável.
+requirements = python3==3.11.9,hostpython3==3.11.9,kivy,kivymd,requests,plyer,certifi,pyjnius
 
 orientation = portrait
 fullscreen = 0
