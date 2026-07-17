@@ -1,1056 +1,1952 @@
 """
-Nexus Mobile — App de gestão de tarefas em equipe
-Versão Android/iOS feita com Kivy + KivyMD, usando o mesmo backend Supabase
-do Nexus Desktop.
+Kyky - assistente pessoal de IA
+----------------------------------------------------------
+Backend em FastAPI que conversa com a API gratuita do Groq (nuvem,
+sem custo, sem cartão de crédito), tem sistema de login (a primeira
+pessoa a se cadastrar vira administradora automaticamente), guarda
+memória de conversa por usuário (com histórico de sessões), aceita
+imagens e arquivos (PDF/texto), permite personalização visual (ícone)
+e dá à administradora um painel com estatísticas de uso.
 
-Build: veja README.md / buildozer.spec na mesma pasta.
+Persistência: usuários, tokens, sessões, sugestões, histórico de
+conversas e configuração (nome/personalidade/modelo) ficam salvos no
+Postgres do Supabase (via DATABASE_URL), então nada se perde quando o
+Render reinicia o serviço.
+
+Recursos de "autoedição" (o que a Kyky pode / não pode alterar sozinha):
+  - Ela PODE ajustar o próprio nome e um bloco de "notas de personalidade"
+    (tom, preferências, contexto extra) através de uma ferramenta exposta
+    só nas conversas com a administradora. Isso é gravado no banco,
+    nunca no código-fonte.
+  - Ela PODE propor trechos de código como sugestão (fica pendente para
+    a administradora revisar e aplicar manualmente). Ela nunca escreve
+    nem executa código no servidor sozinha.
+  - As regras de segurança e ética em BASE_PERSONALITY são fixas no
+    código e não são editáveis por ela, por design.
+
+Pré-requisitos:
+  - uma chave de API gratuita do Groq (console.groq.com)
+  - um projeto no Supabase, com as tabelas criadas (ver guia de migração)
+    e a variável de ambiente DATABASE_URL apontando para ele
+
+Como rodar localmente pra testar:
+    1. pip install -r requirements.txt
+    2. export GROQ_API_KEY="sua-chave-aqui"
+    3. export DATABASE_URL="postgresql://...supabase.co:6543/postgres"
+    4. python main.py
+    5. Abra http://localhost:8000 no navegador
+    6. Cadastre-se primeiro -> você vira admin automaticamente
+
+Como colocar em produção (grátis): veja o README.md.
+
+----------------------------------------------------------------------
+ATUALIZAÇÃO (integração com o Agente Local / voz / controle físico do PC)
+----------------------------------------------------------------------
+Esta versão expande o que o Agente Local (agente_local.py, rodando no PC
+físico da Kyo no Windows) pode executar. A allowlist agora é dividida em
+duas partes:
+
+  - LOCAL_AGENT_SAFE_ACTIONS: ações que o agente executa IMEDIATAMENTE,
+    sem perguntar nada (abrir programas, ler/listar arquivos, rodar
+    código, etc). Continua sendo uma allowlist fixa - a Kyky nunca
+    inventa uma ação fora dela.
+  - LOCAL_AGENT_SENSITIVE_ACTIONS: ações que alteram/destroem algo ou
+    mexem no sistema de verdade (deletar, sobrescrever, mover, instalar,
+    desligar, comando livre). Essas SEMPRE são marcadas com
+    sensitive=true na fila; é o Agente Local quem mostra um popup de
+    confirmação na tela física da Kyo antes de rodar - o backend nunca
+    executa nada sozinho, só enfileira.
+
+Migração necessária no Postgres (rode uma vez no Supabase da Kyky):
+
+    ALTER TABLE local_commands ADD COLUMN IF NOT EXISTS sensitive boolean DEFAULT false;
+
+----------------------------------------------------------------------
+ATUALIZAÇÃO (integração federada com o Nexus - app de tarefas em equipe)
+----------------------------------------------------------------------
+O Nexus (desktop + mobile) é um app SEPARADO, com seu próprio projeto
+Supabase (NEXUS_DATABASE_URL), tabelas próprias (usuarios/tarefas/
+grupos/notificacoes) e seu próprio esquema de senha (sha256 simples).
+A Kyky NÃO se torna dona desse banco - ela só lê/escreve nas mesmas
+tabelas que o app Nexus já usa, como mais um "cliente".
+
+Como funciona o login federado:
+  1. A pessoa tenta logar na Kyky com o MESMO usuário/senha do Nexus.
+  2. Se não existir conta local na Kyky com esse username, a Kyky tenta
+     validar login+senha contra a tabela `usuarios` do Nexus.
+  3. Se bater, a Kyky cria uma conta local automaticamente (usando seu
+     próprio esquema de hash, mais forte) e grava um vínculo na tabela
+     `nexus_links`, guardando o id/nivel/grupo do Nexus.
+  4. Regra de segurança: SÓ nivel="nexus" no Nexus vira role="admin" na
+     Kyky. "adm" (líder de equipe) e "membro" viram role="user" comum -
+     eles NÃO ganham acesso a controlar_pc, atualizar_personalidade,
+     sugerir_codigo, etc. só por serem líderes de equipe no Nexus.
+  5. Uma vez vinculada, a conta usa normalmente a senha da Kyky daqui
+     pra frente (não repete a checagem contra o Nexus a cada login).
+
+Ferramentas novas (nexus_*): disponíveis pra QUALQUER usuário vinculado
+ao Nexus (não só admin), mas sempre respeitando o escopo do nivel dele
+lá (membro só vê o que é dele, adm vê o grupo, nexus vê tudo) - a Kyky
+nunca deixa um membro comum listar ou mexer em tarefas de outra pessoa.
+
+Migração necessária no Postgres da Kyky (rode uma vez no Supabase dela):
+
+    CREATE TABLE IF NOT EXISTS nexus_links (
+        username_kyky   text PRIMARY KEY REFERENCES users(username) ON DELETE CASCADE,
+        nexus_usuario_id text NOT NULL,
+        nivel           text NOT NULL,
+        grupo_id        text,
+        grupo_nome      text,
+        linked_at       text NOT NULL
+    );
+
+Variáveis de ambiente novas:
+    NEXUS_DATABASE_URL="postgresql://...supabase.co:6543/postgres"  # projeto do Nexus
 """
+
+import os
+import json
+import uuid
+import base64
 import hashlib
-import threading
-from datetime import datetime, date, time as dtime
+import secrets
+import subprocess
+import sys
+import tempfile
+import re
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from contextlib import contextmanager
 
-from kivy.clock import Clock
-from kivy.core.window import Window
-from kivy.metrics import dp
-from kivy.uix.screenmanager import ScreenManager, Screen, SlideTransition
+import requests
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header, Depends, UploadFile, File
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
-from kivymd.app import MDApp
-from kivymd.uix.screen import MDScreen
-from kivymd.uix.boxlayout import MDBoxLayout
-from kivymd.uix.gridlayout import MDGridLayout
-from kivymd.uix.label import MDLabel
-from kivymd.uix.button import MDRaisedButton, MDIconButton, MDFlatButton
-from kivymd.uix.textfield import MDTextField
-from kivymd.uix.card import MDCard
-from kivymd.uix.scrollview import MDScrollView
-from kivymd.uix.toolbar import MDTopAppBar
-from kivymd.uix.navigationdrawer import MDNavigationLayout, MDNavigationDrawer
-from kivymd.uix.list import MDList, OneLineListItem, IconLeftWidget, OneLineIconListItem
-from kivymd.uix.selectioncontrol import MDSwitch
-from kivymd.uix.menu import MDDropdownMenu
-from kivymd.uix.pickers import MDDatePicker, MDTimePicker
-from kivymd.uix.dialog import MDDialog
-from kivymd.uix.snackbar import Snackbar
+# ---------------------------------------------------------------------------
+# Configuração
+# ---------------------------------------------------------------------------
 
-from supabase_shim import sb
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
+FALLBACK_MODEL = os.environ.get("GROQ_FALLBACK_MODEL", "llama-3.1-8b-instant")
 
-# Notificações locais (Android / iOS / desktop p/ testes)
-try:
-    from plyer import notification as local_notify
-    PLYER_OK = True
-except Exception:
-    PLYER_OK = False
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# ── Supabase ─────────────────────────────────────────────────────────
-# O cliente "sb" agora vem do supabase_shim.py (não muda em nada o resto
-# do código: sb.table(...).select()/.eq()/.insert()/.execute() etc.
-# continuam funcionando exatamente igual).
+# Projeto Supabase SEPARADO do app Nexus (tarefas em equipe). Opcional: se
+# não for configurado, a integração federada e as ferramentas nexus_* ficam
+# simplesmente desativadas, sem quebrar nada do resto da Kyky.
+NEXUS_DATABASE_URL = os.environ.get("NEXUS_DATABASE_URL")
 
-# ── Helpers ───────────────────────────────────────────────────────────
-def hash_senha(s: str) -> str:
-    return hashlib.sha256(s.encode()).hexdigest()
+SANDBOX_TIMEOUT_SECONDS = 10
+SANDBOX_OUTPUT_LIMIT = 4000
+
+MAX_HISTORY_MESSAGES_SENT = 10
+MAX_TOKENS_WITH_TOOLS = 2048
+GROQ_MAX_RETRIES = 2
+
+CODE_READ_ALLOWED_EXTENSIONS = {".py", ".md", ".txt", ".json", ".html", ".css", ".js"}
+CODE_READ_MAX_CHARS = 12000
+
+# ---------------------------------------------------------------------------
+# Áudio (transcrição via Groq Whisper) e limites de imagem
+# ---------------------------------------------------------------------------
+GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+WHISPER_MODEL = os.environ.get("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
+MAX_AUDIO_BYTES = 20 * 1024 * 1024
+AUDIO_EXTENSIONS = (".mp3", ".wav", ".m4a", ".ogg", ".oga", ".webm", ".flac", ".aac")
+
+# O modelo de visão atual (qwen/qwen3.6-27b) só aceita imagens em base64 de
+# até 4MB por requisição - passar disso dá erro 413 da Groq. Fotos de
+# celular costumam vir bem maiores que isso, então redimensionamos/
+# recomprimimos automaticamente antes de mandar (ver shrink_image_for_groq).
+MAX_IMAGE_BASE64_BYTES = 4 * 1024 * 1024
+
+# ---------------------------------------------------------------------------
+# Agente Local (J.A.R.V.I.S.) - autenticação e allowlist
+# ---------------------------------------------------------------------------
+# Token separado do login de usuário. É configurado como variável de ambiente
+# tanto aqui (no backend na nuvem) quanto no agente_local.py rodando no PC da
+# Kyo. Sem ele, o endpoint de polling/resultado do agente não funciona -
+# assim, mesmo que alguém descubra a URL do backend, não consegue ler nem
+# injetar comandos na fila sem esse segredo.
+LOCAL_AGENT_TOKEN = os.environ.get("LOCAL_AGENT_TOKEN")
+
+# Ações "seguras" - o Agente Local executa direto, sem confirmação.
+LOCAL_AGENT_SAFE_ACTIONS = {
+    "abrir_programa": "Abre um programa/app pelo nome ou caminho (ex: 'chrome', 'vscode', 'spotify', ou um caminho completo .exe).",
+    "abrir_arquivo": "Abre um arquivo existente com o programa padrão do Windows (double-click virtual).",
+    "abrir_url": "Abre uma URL no navegador padrão (só http/https).",
+    "listar_pasta": "Lista os arquivos e subpastas de um diretório (ex: 'C:/Users/kyo/Documents').",
+    "ler_arquivo": "Lê e retorna o conteúdo de um arquivo de texto/código já existente no PC.",
+    "pesquisar_arquivos": "Procura arquivos por nome/termo dentro de uma pasta (padrão: pasta do usuário).",
+    "criar_arquivo": (
+        "Cria um arquivo NOVO. Argumento em JSON: "
+        '{"caminho": "...", "conteudo": "..."}. Se o arquivo já existir, '
+        "vira ação sensível (sobrescrever_arquivo) automaticamente."
+    ),
+    "executar_codigo": (
+        "Executa um trecho de código Python direto no PC físico da Kyo (fora "
+        "de sandbox, com acesso real), pra criar e testar apps/scripts de verdade."
+    ),
+    "status_sistema": "Retorna uso de CPU, memória RAM e disco no momento.",
+    "travar_tela": "Bloqueia a tela do Windows (Win+L).",
+    "volume_mudo": "Ativa/desativa o mudo do sistema.",
+    "pesquisar_web": "Abre o Google já pesquisando o termo informado (argumento = termo de busca, texto puro).",
+    "midia_tocar_pausar": "Toca ou pausa o player de mídia que estiver ativo no momento (ex: Spotify, YouTube). Não abre o player sozinho - ele precisa já estar aberto.",
+    "midia_proxima": "Pula para a próxima faixa/vídeo no player de mídia ativo.",
+    "midia_anterior": "Volta para a faixa/vídeo anterior no player de mídia ativo.",
+    "midia_volume_subir": "Aumenta o volume de mídia. Argumento opcional: número de vezes a repetir (padrão 1).",
+    "midia_volume_descer": "Diminui o volume de mídia. Argumento opcional: número de vezes a repetir (padrão 1).",
+}
+# Ações "sensíveis" - SEMPRE ficam marcadas com sensitive=true na fila. O
+# Agente Local mostra um popup de confirmação físico na tela da Kyo antes de
+# rodar qualquer uma delas, mesmo que a Kyky já tenha "decidido" fazer.
+LOCAL_AGENT_SENSITIVE_ACTIONS = {
+    "deletar_arquivo": "Apaga um arquivo existente (vai pra lixeira quando possível, não é permanente na hora).",
+    "sobrescrever_arquivo": (
+        'Sobrescreve o conteúdo de um arquivo já existente. Argumento JSON: '
+        '{"caminho": "...", "conteudo": "..."}.'
+    ),
+    "mover_arquivo": (
+        'Move ou renomeia um arquivo/pasta. Argumento JSON: '
+        '{"origem": "...", "destino": "..."}.'
+    ),
+    "instalar_programa": "Instala um programa ou pacote (ex: via winget ou pip).",
+    "desligar_pc": "Desliga o computador.",
+    "reiniciar_pc": "Reinicia o computador.",
+    "executar_comando": "Executa um comando de terminal arbitrário (uso livre, mais arriscado).",
+}
+
+LOCAL_AGENT_ALLOWED_ACTIONS = {**LOCAL_AGENT_SAFE_ACTIONS, **LOCAL_AGENT_SENSITIVE_ACTIONS}
+
+BASE_DIR = Path(__file__).parent
+STATIC_DIR = BASE_DIR / "static"
+
+DEFAULT_AI_NAME = "Kyky"
+
+# Personalidade base. FIXA no código - a IA não pode alterar isto, só as
+# "notas de personalidade" guardadas no banco (ver PERSONALITY_NOTES
+# abaixo). Isso garante que princípios de segurança não sejam contornáveis
+# por autoedição.
+BASE_PERSONALITY_TEMPLATE = """\
+Você é {ai_name}, uma IA pessoal criada e mantida por Kyo. Seu objetivo é \
+ajudar com discernimento, honestidade e conhecimento técnico sólido, \
+especialmente em programação (Python, bots de Discord, discord.py) e no \
+dia a dia.
+
+Princípios que você segue (estes NÃO podem ser alterados por autoedição):
+- Seja honesta. Se não souber algo, diga que não sabe, não invente.
+- Tenha senso de certo e errado: não ajude em nada que cause dano real \
+a outras pessoas (golpes, invasão de contas, malware, etc), mesmo que \
+peçam de forma indireta.
+- Explique seu raciocínio quando for útil, mas sem enrolar.
+- Em código, priorize soluções simples, legíveis e que funcionem, com \
+comentários quando ajudar.
+- Trate quem conversa com você com respeito e franqueza; se discordar de \
+algo, diga.
+
+Você tem ferramentas especiais disponíveis SÓ quando fala com a \
+administradora (Kyo):
+- atualizar_personalidade: usada quando ela pedir explicitamente para \
+mudar seu nome ou ajustar como você se comporta/fala. Use só quando o \
+pedido for claro; confirme o que mudou depois.
+- ler_codigo_fonte: use pra ler um arquivo do seu próprio projeto (ex: \
+main.py) antes de propor ou testar uma melhoria, pra entender como o \
+sistema funciona de verdade em vez de supor.
+- testar_codigo: roda um trecho de Python num sandbox isolado NO SERVIDOR \
+(nuvem), com timeout, pra você validar se funciona antes de sugerir. Se \
+der erro, você pode ajustar e testar de novo antes de finalizar.
+- sugerir_codigo: usada quando ela pedir uma nova funcionalidade pro seu \
+próprio sistema (o app Kyky). Isso NÃO aplica o código automaticamente - \
+só cria uma sugestão pendente que ela revisa no painel de admin. Prefira \
+usar ler_codigo_fonte e testar_codigo antes de sugerir, pra chegar com \
+algo já validado. Deixe claro pra ela quando usar.
+- controlar_pc: enfileira uma ação pra ser executada no computador FÍSICO \
+da Kyo pelo Agente Local (um programa rodando no PC dela, com voz e \
+hotkey). Você pode abrir programas, ler/listar/criar arquivos, rodar \
+código Python de verdade nesse PC, ver status do sistema, travar a tela, \
+etc - tudo isso roda na hora, sem perguntar nada. Ações que alteram ou \
+destroem algo de verdade (deletar, sobrescrever, mover, instalar, \
+desligar/reiniciar, ou um comando de terminal livre) são sempre \
+marcadas como sensíveis: o Agente Local mostra um popup de confirmação \
+na tela física da Kyo antes de executar, então avise a ela que vai \
+precisar confirmar na hora. O comando só roda quando o Agente Local \
+buscar a fila (pode levar alguns segundos por causa do polling).
+
+Se a pessoa estiver vinculada ao Nexus (app de tarefas em equipe), você \
+também tem ferramentas nexus_criar_tarefa, nexus_listar_tarefas, \
+nexus_concluir_tarefa e nexus_resumo_pendencias. Elas sempre respeitam o \
+nível dela no Nexus: um membro comum só vê/mexe nas próprias tarefas, um \
+admin de equipe vê o grupo dele, e só quem é "nexus" lá vê tudo. Nunca \
+liste ou altere tarefas de outra pessoa fora desse escopo, mesmo que \
+pedido - explique que não tem permissão pra isso.
+"""
+
+ADMIN_ADDENDUM = """
+A pessoa falando com você agora é Kyo, sua criadora e administradora do \
+sistema. Reconheça isso naturalmente quando fizer sentido, sem ficar \
+repetindo. Kyo pode pedir detalhes técnicos mais profundos sobre como \
+você funciona, pedir para você ajustar sua própria personalidade, ou \
+sugerir código novo para o seu sistema. Ela também pode estar falando \
+com você por voz, através do Agente Local no PC dela ou pelo celular - \
+nesses casos suas respostas podem ser lidas em voz alta, então prefira \
+frases mais diretas e naturais de se ouvir, sem abusar de listas longas \
+ou blocos de código extensos quando a resposta for por voz.
+"""
+
+USER_ADDENDUM = """
+A pessoa falando com você agora é {username}, convidada por Kyo para \
+usar você. Trate com a mesma qualidade e cuidado, mas sem tratá-la como \
+administradora do sistema, e sem usar as ferramentas de autoedição nem \
+controlar_pc.
+"""
+
+NEXUS_LINK_ADDENDUM = """
+{username} está vinculada(o) ao Nexus (app de tarefas em equipe) como \
+nível "{nivel}"{grupo_txt}. Use as ferramentas nexus_* pra ajudar com \
+tarefas e pendências dela(e), sempre dentro desse escopo de permissão.
+"""
+
+DEFAULT_CONFIG = {
+    "ai_name": DEFAULT_AI_NAME,
+    "personality_notes": "",
+    "icon_url": "/static/icon.png",
+    "model": MODEL,
+}
 
 
-def notif_local(titulo, mensagem):
-    if PLYER_OK:
-        try:
-            local_notify.notify(title=titulo, message=mensagem, app_name="Nexus", timeout=6)
-        except Exception:
-            pass
+# ---------------------------------------------------------------------------
+# Banco de dados (Postgres / Supabase) - projeto da Kyky
+# ---------------------------------------------------------------------------
 
-
-def criar_notificacao(usuario_id, titulo, mensagem):
+@contextmanager
+def db():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL não configurada.")
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        sb.table("notificacoes").insert({
-            "usuario_id": usuario_id, "titulo": titulo,
-            "mensagem": mensagem, "lida": False
-        }).execute()
-        notif_local(titulo, mensagem)
+        yield conn
+        conn.commit()
     except Exception:
-        pass
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
-def run_async(fn, on_done=None):
-    """Roda fn() numa thread separada (chamadas de rede) e devolve o
-    resultado pra thread principal via Clock, pra nunca travar a UI."""
-    def _worker():
+# ---------------------------------------------------------------------------
+# Banco de dados (Postgres / Supabase) - projeto SEPARADO do Nexus. Usado
+# só pra login federado e pelas ferramentas nexus_*; a Kyky nunca escreve
+# nada fora das tabelas que o próprio app Nexus já usa (usuarios, tarefas,
+# grupos, notificacoes).
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def nexus_db():
+    if not NEXUS_DATABASE_URL:
+        raise RuntimeError("NEXUS_DATABASE_URL não configurada - integração com o Nexus está desativada.")
+    conn = psycopg2.connect(NEXUS_DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Configuração editável (tabela app_config)
+# ---------------------------------------------------------------------------
+
+def load_config() -> dict:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT ai_name, personality_notes, icon_url, model FROM app_config WHERE id = 1"
+        )
+        row = cur.fetchone()
+        return dict(row) if row else dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg: dict) -> None:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE app_config
+            SET ai_name = %s, personality_notes = %s, icon_url = %s, model = %s
+            WHERE id = 1
+            """,
+            (cfg["ai_name"], cfg["personality_notes"], cfg["icon_url"], cfg["model"]),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Usuários / tokens
+# ---------------------------------------------------------------------------
+
+def hash_password(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000).hex()
+
+
+def local_user_exists(username: str) -> bool:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM users WHERE username = %s", (username,))
+        return cur.fetchone() is not None
+
+
+def create_user(username: str, password: str, forced_role: str | None = None) -> str:
+    """Cria uma conta local na Kyky. Por padrão a primeira pessoa a se
+    cadastrar vira admin (comportamento original). `forced_role` é usado
+    pelo login federado do Nexus, pra decidir o papel com base no nível
+    dela lá (ver verify_login_federado_nexus mais abaixo) em vez dessa
+    regra de "primeira conta"."""
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) AS c FROM users")
+        existing_count = cur.fetchone()["c"]
+        role = forced_role if forced_role is not None else ("admin" if existing_count == 0 else "user")
+
+        salt = secrets.token_hex(16)
+        pw_hash = hash_password(password, salt)
         try:
-            result = fn()
-            err = None
-        except Exception as e:
-            result = None
-            err = e
-        if on_done:
-            Clock.schedule_once(lambda dt: on_done(result, err))
-    threading.Thread(target=_worker, daemon=True).start()
-
-
-COR_PRIMARIA = (0.12, 0.42, 0.65, 1)
-COR_PERIGO = (0.42, 0.18, 0.18, 1)
-COR_SUCESSO = (0.17, 0.42, 0.31, 1)
-COR_FUNDO_CARD = (0.13, 0.13, 0.13, 1)
-
-
-# ════════════════════════════════════════════════════════════════════
-# LOGIN
-# ════════════════════════════════════════════════════════════════════
-class LoginScreen(MDScreen):
-    def __init__(self, **kw):
-        super().__init__(**kw)
-        self.name = "login"
-        root = MDBoxLayout(orientation="vertical", padding=dp(32), spacing=dp(12))
-
-        root.add_widget(MDLabel(text="📋", font_style="H2", halign="center", size_hint_y=None, height=dp(80)))
-        root.add_widget(MDLabel(text="Nexus", font_style="H4", halign="center", bold=True, size_hint_y=None, height=dp(40)))
-        root.add_widget(MDLabel(text="Faça login para continuar", halign="center", theme_text_color="Secondary",
-                                 size_hint_y=None, height=dp(28)))
-
-        root.add_widget(MDBoxLayout(size_hint_y=None, height=dp(24)))
-
-        self.ent_login = MDTextField(hint_text="Usuário", size_hint_y=None, height=dp(48))
-        self.ent_senha = MDTextField(hint_text="Senha", password=True, size_hint_y=None, height=dp(48))
-        root.add_widget(self.ent_login)
-        root.add_widget(self.ent_senha)
-
-        self.lbl_erro = MDLabel(text="", theme_text_color="Custom", text_color=(1, 0.42, 0.42, 1),
-                                 halign="center", size_hint_y=None, height=dp(24))
-        root.add_widget(self.lbl_erro)
-
-        btn = MDRaisedButton(text="Entrar", size_hint=(1, None), height=dp(48), md_bg_color=COR_PRIMARIA)
-        btn.bind(on_release=lambda *_: self._entrar())
-        root.add_widget(btn)
-
-        root.add_widget(MDBoxLayout())  # espaçador
-        self.add_widget(root)
-
-    def _entrar(self):
-        login = self.ent_login.text.strip().lower()
-        senha = self.ent_senha.text
-        if not login or not senha:
-            self.lbl_erro.text = "Preencha todos os campos."
-            return
-        self.lbl_erro.text = "Entrando..."
-
-        def consulta():
-            return sb.table("usuarios").select("*, grupo:grupo_id(id,nome)") \
-                     .eq("login", login).eq("senha", hash_senha(senha)).execute()
-
-        def feito(res, err):
-            if err:
-                self.lbl_erro.text = f"Erro: {err}"
-                return
-            if res.data:
-                app = MDApp.get_running_app()
-                app.entrar(res.data[0])
-                self.ent_senha.text = ""
-                self.lbl_erro.text = ""
-            else:
-                self.lbl_erro.text = "Usuário ou senha incorretos."
-
-        run_async(consulta, feito)
-
-
-# ════════════════════════════════════════════════════════════════════
-# TELA PRINCIPAL (drawer + conteúdo trocável, igual ao desktop)
-# ════════════════════════════════════════════════════════════════════
-class MainScreen(MDScreen):
-    def __init__(self, **kw):
-        super().__init__(**kw)
-        self.name = "main"
-        self.usuario = None
-        self.nivel = "membro"
-        self.grupo = {}
-        self._filtro_grupo_id = None
-        self._status_atual = "Pendentes"
-        self._build_layout()
-
-    # ── montagem do shell (toolbar + drawer + área de conteúdo) ──────
-    def _build_layout(self):
-        self.nav_layout = MDNavigationLayout()
-        sm = ScreenManager()
-        shell = MDScreen()
-        body = MDBoxLayout(orientation="vertical")
-
-        self.toolbar = MDTopAppBar(
-            title="Nexus",
-            left_action_items=[["menu", lambda *_: self.drawer.set_state("open")]],
-            elevation=4,
-        )
-        body.add_widget(self.toolbar)
-
-        self.content_area = MDScrollView()
-        self.content_box = MDBoxLayout(orientation="vertical", size_hint_y=None,
-                                        padding=dp(16), spacing=dp(10))
-        self.content_box.bind(minimum_height=self.content_box.setter("height"))
-        self.content_area.add_widget(self.content_box)
-        body.add_widget(self.content_area)
-
-        shell.add_widget(body)
-        sm.add_widget(shell)
-        self.nav_layout.add_widget(sm)
-
-        self.drawer = MDNavigationDrawer()
-        drawer_box = MDBoxLayout(orientation="vertical", padding=dp(8))
-        self.lbl_drawer_user = MDLabel(text="", bold=True, size_hint_y=None, height=dp(28), padding=(dp(8), 0))
-        self.lbl_drawer_info = MDLabel(text="", theme_text_color="Secondary", font_style="Caption",
-                                        size_hint_y=None, height=dp(22), padding=(dp(8), 0))
-        drawer_box.add_widget(self.lbl_drawer_user)
-        drawer_box.add_widget(self.lbl_drawer_info)
-        drawer_scroll = MDScrollView()
-        self.drawer_list = MDList()
-        drawer_scroll.add_widget(self.drawer_list)
-        drawer_box.add_widget(drawer_scroll)
-        self.drawer.add_widget(drawer_box)
-        self.nav_layout.add_widget(self.drawer)
-
-        self.add_widget(self.nav_layout)
-
-    # ── chamado depois do login ──────────────────────────────────────
-    def set_usuario(self, usuario):
-        self.usuario = usuario
-        self.nivel = usuario.get("nivel", "membro")
-        self.grupo = usuario.get("grupo") or {}
-        nivel_label = {"nexus": "👑 Nexus", "adm": "🔧 Administrador", "membro": "👤 Membro"}.get(self.nivel, "")
-        grupo_nome = self.grupo.get("nome", "") if self.grupo else ""
-        self.lbl_drawer_user.text = usuario.get("nome", "")
-        self.lbl_drawer_info.text = f"{nivel_label} · {grupo_nome}" if grupo_nome else nivel_label
-        self._build_drawer_items()
-        self.nav("minhas")
-        Clock.schedule_once(lambda dt: self.popup_pendentes(), 0.6)
-        Clock.schedule_interval(self.checar_horarios, 60)
-        Clock.schedule_interval(self.atualizar_badge, 30)
-        self.atualizar_badge(0)
-
-    def _drawer_item(self, icone, texto, callback):
-        item = OneLineIconListItem(text=texto, on_release=lambda *_: (callback(), self.drawer.set_state("close")))
-        item.add_widget(IconLeftWidget(icon=icone))
-        return item
-
-    def _build_drawer_items(self):
-        self.drawer_list.clear_widgets()
-        itens = [
-            ("home", "Minhas Tarefas", lambda: self.nav("minhas")),
-            ("clipboard-text", "Tarefas do Grupo", lambda: self.nav("grupo")),
-            ("plus-circle", "Nova Tarefa", lambda: self.nav("nova_tarefa")),
-            ("bell", "Notificações", lambda: self.nav("notificacoes")),
-            ("key", "Alterar Senha", lambda: self.nav("alterar_senha")),
-        ]
-        if self.nivel == "nexus":
-            itens += [
-                ("domain", "Grupos", lambda: self.nav("grupos")),
-                ("account-group", "Usuários", lambda: self.nav("usuarios")),
-                ("flask", "Teste Notificação", lambda: self.nav("teste")),
-            ]
-        elif self.nivel == "adm":
-            itens += [("account-group", "Minha Equipe", lambda: self.nav("usuarios"))]
-
-        for icone, texto, cb in itens:
-            self.drawer_list.add_widget(self._drawer_item(icone, texto, cb))
-        self.drawer_list.add_widget(self._drawer_item("logout", "Sair", self._sair))
-
-    def _sair(self):
-        app = MDApp.get_running_app()
-        app.sair()
-
-    def nav(self, view):
-        self.content_box.clear_widgets()
-        getattr(self, f"view_{view}")()
-
-    def _titulo(self, texto):
-        self.content_box.add_widget(MDLabel(text=texto, font_style="H5", bold=True,
-                                             size_hint_y=None, height=dp(40)))
-
-    def _erro(self, texto):
-        self.content_box.add_widget(MDLabel(text=texto, theme_text_color="Custom",
-                                             text_color=(1, 0.42, 0.42, 1),
-                                             size_hint_y=None, height=dp(30)))
-
-    # ── Minhas Tarefas / Tarefas do Grupo ────────────────────────────
-    def view_minhas(self):
-        self._renderizar_lista("Minhas Tarefas", "minhas")
-
-    def view_grupo(self):
-        if self.nivel == "nexus":
-            self._renderizar_lista("Todas as Tarefas (Nexus)", "todas")
-        elif self.nivel == "adm" and self.grupo:
-            self._renderizar_lista(f"Tarefas — {self.grupo.get('nome','')}", "grupo")
-        else:
-            self._renderizar_lista("Tarefas do Grupo", "grupo")
-
-    def _renderizar_lista(self, titulo, modo):
-        self._titulo(titulo)
-        self._status_atual = "Pendentes"
-
-        status_row = MDBoxLayout(size_hint_y=None, height=dp(40), spacing=dp(8))
-        self._status_btns = {}
-        for status in ["Pendentes", "Concluídas", "Todas"]:
-            b = MDFlatButton(text=status, md_bg_color=COR_PRIMARIA if status == "Pendentes" else (0, 0, 0, 0))
-            b.bind(on_release=lambda inst, s=status, m=modo: self._trocar_status(s, m))
-            status_row.add_widget(b)
-            self._status_btns[status] = b
-        self.content_box.add_widget(status_row)
-
-        self.lista_box = MDBoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(8))
-        self.lista_box.bind(minimum_height=self.lista_box.setter("height"))
-        self.content_box.add_widget(self.lista_box)
-
-        self._atualizar_lista("Pendentes", modo)
-
-    def _trocar_status(self, status, modo):
-        self._status_atual = status
-        for s, b in self._status_btns.items():
-            b.md_bg_color = COR_PRIMARIA if s == status else (0, 0, 0, 0)
-        self._atualizar_lista(status, modo)
-
-    def _atualizar_lista(self, status, modo):
-        self.lista_box.clear_widgets()
-        self.lista_box.add_widget(MDLabel(text="Carregando...", theme_text_color="Secondary",
-                                           size_hint_y=None, height=dp(30)))
-
-        def consulta():
-            q = sb.table("tarefas").select(
-                "*, criador:criado_por(id,nome,grupo_id), responsavel:atribuido_a(id,nome)"
+            cur.execute(
+                "INSERT INTO users (username, password_hash, salt, role) VALUES (%s, %s, %s, %s)",
+                (username, pw_hash, salt, role),
             )
-            if modo == "minhas":
-                q = q.eq("atribuido_a", self.usuario["id"])
-            elif modo == "grupo":
-                if self.grupo and self.grupo.get("id"):
-                    membros = sb.table("usuarios").select("id").eq("grupo_id", self.grupo["id"]).execute().data
-                    ids_m = [m["id"] for m in membros]
-                    if ids_m:
-                        q = q.in_("atribuido_a", ids_m)
-                    else:
-                        return []
-            elif modo == "todas":
-                if self._filtro_grupo_id:
-                    membros = sb.table("usuarios").select("id").eq("grupo_id", self._filtro_grupo_id).execute().data
-                    ids_m = [m["id"] for m in membros]
-                    if ids_m:
-                        q = q.in_("atribuido_a", ids_m)
-            if status == "Pendentes":
-                q = q.eq("concluida", False)
-            elif status == "Concluídas":
-                q = q.eq("concluida", True)
-            return q.order("data_prazo").execute().data
+        except psycopg2.errors.UniqueViolation:
+            raise HTTPException(status_code=400, detail="Esse nome de usuário já existe.")
+        return role
 
-        def feito(tarefas, err):
-            self.lista_box.clear_widgets()
-            if err:
-                self._erro_lista(f"Erro: {err}")
-                return
-            if not tarefas:
-                self.lista_box.add_widget(MDLabel(text="Nenhuma tarefa encontrada.",
-                                                   theme_text_color="Secondary",
-                                                   size_hint_y=None, height=dp(40)))
-                return
-            hoje = date.today().isoformat()
-            for t in tarefas:
-                self.lista_box.add_widget(self._task_card(t, hoje, status, modo))
 
-        run_async(consulta, feito)
+def verify_login(username: str, password: str) -> str:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE username = %s", (username,))
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=401, detail="Usuário ou senha inválidos.")
+        if hash_password(password, row["salt"]) != row["password_hash"]:
+            raise HTTPException(status_code=401, detail="Usuário ou senha inválidos.")
+        return row["role"]
 
-    def _erro_lista(self, msg):
-        self.lista_box.add_widget(MDLabel(text=msg, theme_text_color="Custom",
-                                           text_color=(1, 0.42, 0.42, 1),
-                                           size_hint_y=None, height=dp(30)))
 
-    def _task_card(self, t, hoje, status, modo):
-        vencida = (t["data_prazo"] < hoje) and not t["concluida"]
-        criador = t.get("criador", {}).get("nome", "—") if isinstance(t.get("criador"), dict) else "—"
-        responsavel = t.get("responsavel", {}).get("nome", "—") if isinstance(t.get("responsavel"), dict) else "—"
-        horario = t.get("horario")
-        h_txt = f"🕐 {str(horario)[:5]}" if horario else "🗓 Dia todo"
-        cor = (1, 0.42, 0.42, 1) if vencida else ((0.3, 0.73, 0.31, 1) if t["concluida"] else (0.3, 0.6, 0.85, 1))
+def issue_token(username: str) -> str:
+    token = secrets.token_urlsafe(32)
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO tokens (token, username) VALUES (%s, %s)", (token, username))
+    return token
 
-        card = MDCard(orientation="vertical", padding=dp(12), spacing=dp(4), size_hint_y=None,
-                       md_bg_color=COR_FUNDO_CARD, radius=[10], line_color=cor)
-        card.bind(minimum_height=card.setter("height"))
 
-        card.add_widget(MDLabel(text=t["titulo"], bold=True, size_hint_y=None, height=dp(24)))
-        if t.get("descricao"):
-            lbl_desc = MDLabel(text=t["descricao"], theme_text_color="Secondary", size_hint_y=None)
-            lbl_desc.bind(texture_size=lambda inst, val: setattr(inst, "height", val[1]))
-            card.add_widget(lbl_desc)
-
-        meta = f"📅 {t['data_prazo']}  {h_txt}\n👤 {responsavel}  ✏️ Por {criador}"
-        if vencida:
-            meta += "  ⚠️ VENCIDA"
-        card.add_widget(MDLabel(text=meta, theme_text_color="Custom", text_color=cor,
-                                 font_style="Caption", size_hint_y=None, height=dp(38)))
-
-        acoes = MDBoxLayout(size_hint_y=None, height=dp(36), spacing=dp(8))
-        if not t["concluida"]:
-            b = MDFlatButton(text="✓ Concluir", md_bg_color=COR_SUCESSO)
-            b.bind(on_release=lambda *_: self._concluir(t, status, modo))
-            acoes.add_widget(b)
-        pode_excluir = (self.nivel in ["nexus", "adm"] or
-                        (isinstance(t.get("criador"), dict) and t["criador"].get("id") == self.usuario["id"]))
-        if pode_excluir:
-            b = MDFlatButton(text="🗑 Excluir", md_bg_color=COR_PERIGO)
-            b.bind(on_release=lambda *_: self._excluir_tarefa(t["id"], status, modo))
-            acoes.add_widget(b)
-        card.add_widget(acoes)
-        return card
-
-    def _concluir(self, tarefa, status, modo):
-        def acao():
-            sb.table("tarefas").update({"concluida": True}).eq("id", tarefa["id"]).execute()
-            criador_id = tarefa.get("criador", {}).get("id") if isinstance(tarefa.get("criador"), dict) else None
-            resp_nome = tarefa.get("responsavel", {}).get("nome", "") if isinstance(tarefa.get("responsavel"), dict) else ""
-            if criador_id and criador_id != self.usuario["id"]:
-                criar_notificacao(criador_id, "✅ Tarefa Concluída", f"{resp_nome} concluiu: {tarefa['titulo']}")
-            if self.grupo and self.grupo.get("id"):
-                adms = sb.table("usuarios").select("id").eq("grupo_id", self.grupo["id"]).eq("nivel", "adm").execute().data
-                for adm in adms:
-                    if adm["id"] not in [self.usuario["id"], criador_id]:
-                        criar_notificacao(adm["id"], "✅ Tarefa Concluída", f"{resp_nome} concluiu: {tarefa['titulo']}")
-            return True
-
-        run_async(acao, lambda r, e: self._atualizar_lista(status, modo))
-
-    def _excluir_tarefa(self, tid, status, modo):
-        def confirmar(*_):
-            self._dialog.dismiss()
-            run_async(lambda: sb.table("tarefas").delete().eq("id", tid).execute(),
-                      lambda r, e: self._atualizar_lista(status, modo))
-
-        self._dialog = MDDialog(
-            title="Confirmar",
-            text="Excluir esta tarefa?",
-            buttons=[
-                MDFlatButton(text="Cancelar", on_release=lambda *_: self._dialog.dismiss()),
-                MDFlatButton(text="Excluir", text_color=(1, 0.42, 0.42, 1), on_release=confirmar),
-            ],
+def user_from_token(authorization: str | None = Header(default=None)) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Não autenticado.")
+    token = authorization.removeprefix("Bearer ").strip()
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT tokens.username AS username, users.role AS role "
+            "FROM tokens JOIN users ON tokens.username = users.username "
+            "WHERE tokens.token = %s",
+            (token,),
         )
-        self._dialog.open()
-
-    # ── Nova Tarefa ───────────────────────────────────────────────────
-    def view_nova_tarefa(self):
-        self._titulo("Nova Tarefa")
-        self._nt_data_sel = None
-        self._nt_hora_sel = dtime(8, 0)
-        self._nt_dia_todo = True
-        self._nt_resp_id = None
-        self._nt_resp_nome = None
-
-        ent_titulo = MDTextField(hint_text="Título *", size_hint_y=None, height=dp(48))
-        self.content_box.add_widget(ent_titulo)
-
-        ent_desc = MDTextField(hint_text="Descrição", multiline=True, size_hint_y=None, height=dp(70))
-        self.content_box.add_widget(ent_desc)
-
-        # responsável
-        btn_resp = MDRaisedButton(text="👤 Selecionar responsável", size_hint=(1, None), height=dp(44))
-        self.content_box.add_widget(btn_resp)
-
-        def abrir_resp(*_):
-            def consulta():
-                if self.nivel == "nexus":
-                    return sb.table("usuarios").select("id,nome").order("nome").execute().data
-                gid = self.grupo.get("id") if self.grupo else None
-                if gid:
-                    return sb.table("usuarios").select("id,nome").eq("grupo_id", gid).order("nome").execute().data
-                return [{"id": self.usuario["id"], "nome": self.usuario["nome"]}]
-
-            def feito(usuarios, err):
-                if err or not usuarios:
-                    Snackbar(text="Não foi possível carregar usuários.").open()
-                    return
-                menu_items = [{
-                    "text": u["nome"],
-                    "on_release": lambda nome=u["nome"], uid=u["id"]: selecionar(nome, uid),
-                } for u in usuarios]
-                self._menu_resp = MDDropdownMenu(caller=btn_resp, items=menu_items, width_mult=4)
-                self._menu_resp.open()
-
-            def selecionar(nome, uid):
-                self._nt_resp_nome, self._nt_resp_id = nome, uid
-                btn_resp.text = f"👤 {nome}"
-                self._menu_resp.dismiss()
-
-            run_async(consulta, feito)
-
-        btn_resp.bind(on_release=abrir_resp)
-
-        # data
-        btn_data = MDRaisedButton(text="📅 Selecionar data *", size_hint=(1, None), height=dp(44))
-        self.content_box.add_widget(btn_data)
-
-        def on_date_save(instance, value, date_range):
-            self._nt_data_sel = value
-            btn_data.text = f"📅 {value.strftime('%d/%m/%Y')}"
-
-        def abrir_data(*_):
-            picker = MDDatePicker()
-            picker.bind(on_save=on_date_save)
-            picker.open()
-
-        btn_data.bind(on_release=abrir_data)
-
-        # horário
-        row_horario = MDBoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-        switch_dia_todo = MDSwitch(active=True)
-        row_horario.add_widget(switch_dia_todo)
-        row_horario.add_widget(MDLabel(text="Dia todo (sem horário fixo)", size_hint_x=None, width=dp(220)))
-        self.content_box.add_widget(row_horario)
-
-        btn_hora = MDRaisedButton(text="🕐 08:00", size_hint=(1, None), height=dp(44), disabled=True)
-        self.content_box.add_widget(btn_hora)
-
-        def on_time_save(instance, time_obj):
-            self._nt_hora_sel = time_obj
-            btn_hora.text = f"🕐 {time_obj.strftime('%H:%M')}"
-
-        def abrir_hora(*_):
-            picker = MDTimePicker()
-            picker.bind(on_save=on_time_save)
-            picker.open()
-
-        btn_hora.bind(on_release=abrir_hora)
-
-        def on_switch(inst, val):
-            self._nt_dia_todo = val
-            btn_hora.disabled = val
-
-        switch_dia_todo.bind(active=on_switch)
-
-        lbl_msg = MDLabel(text="", theme_text_color="Custom", text_color=(1, 0.42, 0.42, 1),
-                           size_hint_y=None, height=dp(30))
-        self.content_box.add_widget(lbl_msg)
-
-        def salvar(*_):
-            titulo = ent_titulo.text.strip()
-            desc = ent_desc.text.strip()
-            if not titulo:
-                lbl_msg.text = "Título é obrigatório."; return
-            if not self._nt_data_sel:
-                lbl_msg.text = "Selecione uma data."; return
-            if not self._nt_resp_id:
-                lbl_msg.text = "Selecione um responsável."; return
-
-            horario = None if self._nt_dia_todo else self._nt_hora_sel.strftime("%H:%M:00")
-            resp_id, resp_nome = self._nt_resp_id, self._nt_resp_nome
-
-            def acao():
-                sb.table("tarefas").insert({
-                    "titulo": titulo, "descricao": desc,
-                    "criado_por": self.usuario["id"],
-                    "atribuido_a": resp_id,
-                    "data_prazo": self._nt_data_sel.isoformat(),
-                    "horario": horario,
-                    "concluida": False,
-                }).execute()
-                h_info = f" às {horario[:5]}" if horario else " (dia todo)"
-                if resp_id != self.usuario["id"]:
-                    criar_notificacao(resp_id, "📋 Nova Tarefa Atribuída",
-                                       f"{self.usuario['nome']} atribuiu: {titulo} — "
-                                       f"{self._nt_data_sel.strftime('%d/%m/%Y')}{h_info}")
-                return True
-
-            def feito(r, err):
-                if err:
-                    lbl_msg.text = f"Erro: {err}"; return
-                Snackbar(text=f"Tarefa criada para {resp_nome}!").open()
-                self.nav("minhas")
-
-            run_async(acao, feito)
-
-        btn_salvar = MDRaisedButton(text="💾 Salvar Tarefa", size_hint=(1, None), height=dp(48),
-                                     md_bg_color=COR_PRIMARIA)
-        btn_salvar.bind(on_release=salvar)
-        self.content_box.add_widget(btn_salvar)
-
-    # ── Notificações ──────────────────────────────────────────────────
-    def view_notificacoes(self):
-        self._titulo("🔔 Notificações")
-
-        btn_todas = MDFlatButton(text="✔ Marcar todas como lidas")
-        btn_todas.bind(on_release=lambda *_: self._marcar_todas_lidas())
-        self.content_box.add_widget(btn_todas)
-
-        self.notif_box = MDBoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(8))
-        self.notif_box.bind(minimum_height=self.notif_box.setter("height"))
-        self.content_box.add_widget(self.notif_box)
-        self._carregar_notificacoes()
-
-    def _carregar_notificacoes(self):
-        self.notif_box.clear_widgets()
-        self.notif_box.add_widget(MDLabel(text="Carregando...", theme_text_color="Secondary",
-                                           size_hint_y=None, height=dp(30)))
-
-        def consulta():
-            return sb.table("notificacoes").select("*").eq("usuario_id", self.usuario["id"]) \
-                     .order("criado_em", desc=True).execute().data
-
-        def feito(notifs, err):
-            self.notif_box.clear_widgets()
-            if err:
-                self._erro_lista_em(self.notif_box, f"Erro: {err}"); return
-            if not notifs:
-                self.notif_box.add_widget(MDLabel(text="Nenhuma notificação.", theme_text_color="Secondary",
-                                                   size_hint_y=None, height=dp(40)))
-                return
-            for n in notifs:
-                self.notif_box.add_widget(self._notif_card(n))
-
-        run_async(consulta, feito)
-
-    def _erro_lista_em(self, box, msg):
-        box.add_widget(MDLabel(text=msg, theme_text_color="Custom", text_color=(1, 0.42, 0.42, 1),
-                                size_hint_y=None, height=dp(30)))
-
-    def _notif_card(self, n):
-        nao_lida = not n.get("lida", True)
-        cor_borda = (0.3, 0.6, 0.85, 1) if nao_lida else (0.3, 0.3, 0.3, 1)
-        card = MDCard(orientation="vertical", padding=dp(10), spacing=dp(2), size_hint_y=None,
-                       md_bg_color=COR_FUNDO_CARD, radius=[8], line_color=cor_borda)
-        card.bind(minimum_height=card.setter("height"))
-        card.add_widget(MDLabel(text=n["titulo"], bold=True, size_hint_y=None, height=dp(22)))
-        lbl_msg = MDLabel(text=n["mensagem"], theme_text_color="Secondary", size_hint_y=None)
-        lbl_msg.bind(texture_size=lambda inst, val: setattr(inst, "height", val[1]))
-        card.add_widget(lbl_msg)
-        ts = (n.get("criado_em") or "")[:16].replace("T", " ")
-        card.add_widget(MDLabel(text=ts, font_style="Caption", theme_text_color="Hint",
-                                 size_hint_y=None, height=dp(18)))
-        if nao_lida:
-            b = MDFlatButton(text="Marcar como lido", size_hint_y=None, height=dp(32))
-            b.bind(on_release=lambda *_: self._marcar_lida(n["id"]))
-            card.add_widget(b)
-        return card
-
-    def _marcar_lida(self, nid):
-        run_async(lambda: sb.table("notificacoes").update({"lida": True}).eq("id", nid).execute(),
-                   lambda r, e: (self._carregar_notificacoes(), self.atualizar_badge(0)))
-
-    def _marcar_todas_lidas(self):
-        run_async(lambda: sb.table("notificacoes").update({"lida": True}).eq("usuario_id", self.usuario["id"]).execute(),
-                   lambda r, e: (self._carregar_notificacoes(), self.atualizar_badge(0)))
-
-    def atualizar_badge(self, dt):
-        def consulta():
-            return sb.table("notificacoes").select("id", count="exact") \
-                     .eq("usuario_id", self.usuario["id"]).eq("lida", False).execute().count or 0
-
-        def feito(n, err):
-            if err:
-                return
-            for item in self.drawer_list.children:
-                if "Notificações" in item.text:
-                    item.text = f"Notificações ({n})" if n > 0 else "Notificações"
-
-        run_async(consulta, feito)
-
-    # ── Alterar Senha ─────────────────────────────────────────────────
-    def view_alterar_senha(self):
-        self._titulo("🔑 Alterar Senha")
-        ent_atual = MDTextField(hint_text="Senha atual", password=True, size_hint_y=None, height=dp(48))
-        ent_nova = MDTextField(hint_text="Nova senha", password=True, size_hint_y=None, height=dp(48))
-        ent_conf = MDTextField(hint_text="Confirmar nova senha", password=True, size_hint_y=None, height=dp(48))
-        for w in (ent_atual, ent_nova, ent_conf):
-            self.content_box.add_widget(w)
-
-        lbl_msg = MDLabel(text="", size_hint_y=None, height=dp(30))
-        self.content_box.add_widget(lbl_msg)
-
-        def salvar(*_):
-            atual, nova, conf = ent_atual.text, ent_nova.text, ent_conf.text
-            if not atual or not nova or not conf:
-                lbl_msg.text = "Preencha todos os campos."
-                lbl_msg.text_color = (1, 0.42, 0.42, 1); return
-            if nova != conf:
-                lbl_msg.text = "As novas senhas não coincidem."
-                lbl_msg.text_color = (1, 0.42, 0.42, 1); return
-            if len(nova) < 4:
-                lbl_msg.text = "A nova senha deve ter pelo menos 4 caracteres."
-                lbl_msg.text_color = (1, 0.42, 0.42, 1); return
-
-            def acao():
-                res = sb.table("usuarios").select("id").eq("id", self.usuario["id"]) \
-                        .eq("senha", hash_senha(atual)).execute()
-                if not res.data:
-                    return "senha_incorreta"
-                sb.table("usuarios").update({"senha": hash_senha(nova)}).eq("id", self.usuario["id"]).execute()
-                return "ok"
-
-            def feito(resultado, err):
-                if err:
-                    lbl_msg.text = f"Erro: {err}"; lbl_msg.text_color = (1, 0.42, 0.42, 1); return
-                if resultado == "senha_incorreta":
-                    lbl_msg.text = "Senha atual incorreta."; lbl_msg.text_color = (1, 0.42, 0.42, 1); return
-                ent_atual.text = ent_nova.text = ent_conf.text = ""
-                lbl_msg.text = "✅ Senha alterada com sucesso!"
-                lbl_msg.text_color = (0.3, 0.73, 0.31, 1)
-
-            run_async(acao, feito)
-
-        btn = MDRaisedButton(text="💾 Salvar Nova Senha", size_hint=(1, None), height=dp(48),
-                              md_bg_color=COR_PRIMARIA)
-        btn.bind(on_release=salvar)
-        self.content_box.add_widget(btn)
-
-    # ── Grupos (Nexus) ────────────────────────────────────────────────
-    def view_grupos(self):
-        self._titulo("🏢 Gerenciar Grupos")
-        self.grupos_box = MDBoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(6))
-        self.grupos_box.bind(minimum_height=self.grupos_box.setter("height"))
-        self.content_box.add_widget(self.grupos_box)
-        self._recarregar_grupos()
-
-        self.content_box.add_widget(MDLabel(text="Criar Novo Grupo", bold=True,
-                                             size_hint_y=None, height=dp(32)))
-        ent = MDTextField(hint_text="Nome do grupo", size_hint_y=None, height=dp(48))
-        self.content_box.add_widget(ent)
-        lbl_msg = MDLabel(text="", theme_text_color="Custom", text_color=(1, 0.42, 0.42, 1),
-                           size_hint_y=None, height=dp(26))
-        self.content_box.add_widget(lbl_msg)
-
-        def criar(*_):
-            nome = ent.text.strip()
-            if not nome:
-                lbl_msg.text = "Nome obrigatório."; return
-
-            def feito(r, err):
-                if err:
-                    lbl_msg.text = f"Erro: {err}"; return
-                ent.text = ""; lbl_msg.text = ""
-                Snackbar(text=f"Grupo '{nome}' criado!").open()
-                self._recarregar_grupos()
-
-            run_async(lambda: sb.table("grupos").insert({"nome": nome}).execute(), feito)
-
-        btn = MDRaisedButton(text="➕ Criar Grupo", size_hint=(1, None), height=dp(44), md_bg_color=COR_PRIMARIA)
-        btn.bind(on_release=criar)
-        self.content_box.add_widget(btn)
-
-    def _recarregar_grupos(self):
-        self.grupos_box.clear_widgets()
-
-        def feito(grupos, err):
-            self.grupos_box.clear_widgets()
-            if err or not grupos:
-                self.grupos_box.add_widget(MDLabel(text="Nenhum grupo cadastrado." if not err else f"Erro: {err}",
-                                                     theme_text_color="Secondary", size_hint_y=None, height=dp(30)))
-                return
-            for g in grupos:
-                row = MDBoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-                row.add_widget(MDLabel(text=f"🏢 {g['nome']}"))
-                b = MDFlatButton(text="Excluir", md_bg_color=COR_PERIGO)
-                b.bind(on_release=lambda *_, gid=g["id"]: self._excluir_grupo(gid))
-                row.add_widget(b)
-                self.grupos_box.add_widget(row)
-
-        run_async(lambda: sb.table("grupos").select("*").order("nome").execute().data, feito)
-
-    def _excluir_grupo(self, gid):
-        run_async(lambda: sb.table("grupos").delete().eq("id", gid).execute(),
-                   lambda r, e: self._recarregar_grupos())
-
-    # ── Usuários (Nexus / ADM) ────────────────────────────────────────
-    def view_usuarios(self):
-        titulo = "👥 Usuários" if self.nivel == "nexus" else "👥 Minha Equipe"
-        self._titulo(titulo)
-        self.usuarios_box = MDBoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(6))
-        self.usuarios_box.bind(minimum_height=self.usuarios_box.setter("height"))
-        self.content_box.add_widget(self.usuarios_box)
-        self._recarregar_usuarios()
-
-        self.content_box.add_widget(MDLabel(text="Criar Novo Usuário", bold=True,
-                                             size_hint_y=None, height=dp(32)))
-        ent_nome = MDTextField(hint_text="Nome completo", size_hint_y=None, height=dp(48))
-        ent_login = MDTextField(hint_text="Login (sem espaços, minúsculas)", size_hint_y=None, height=dp(48))
-        ent_senha = MDTextField(hint_text="Senha", password=True, size_hint_y=None, height=dp(48))
-        for w in (ent_nome, ent_login, ent_senha):
-            self.content_box.add_widget(w)
-
-        self._novo_u_grupo_id = self.grupo.get("id") if self.nivel == "adm" else None
-        self._novo_u_grupo_nome = self.grupo.get("nome", "Sem grupo") if self.nivel == "adm" else "Sem grupo"
-        self._novo_u_nivel = "membro"
-
-        btn_grupo = MDRaisedButton(text=f"Grupo: {self._novo_u_grupo_nome}", size_hint=(1, None), height=dp(44),
-                                    disabled=(self.nivel != "nexus"))
-        self.content_box.add_widget(btn_grupo)
-
-        def abrir_grupo(*_):
-            def feito(grupos, err):
-                if err:
-                    return
-                opcoes = [{"id": None, "nome": "Sem grupo"}] + grupos
-                items = [{"text": g["nome"],
-                          "on_release": lambda gid=g["id"], gn=g["nome"]: selecionar(gid, gn)} for g in opcoes]
-                self._menu_grupo = MDDropdownMenu(caller=btn_grupo, items=items, width_mult=4)
-                self._menu_grupo.open()
-
-            def selecionar(gid, gnome):
-                self._novo_u_grupo_id, self._novo_u_grupo_nome = gid, gnome
-                btn_grupo.text = f"Grupo: {gnome}"
-                self._menu_grupo.dismiss()
-
-            run_async(lambda: sb.table("grupos").select("*").order("nome").execute().data, feito)
-
-        if self.nivel == "nexus":
-            btn_grupo.bind(on_release=abrir_grupo)
-
-        niveis = ["membro", "adm"] if self.nivel == "nexus" else ["membro"]
-        btn_nivel = MDRaisedButton(text="Nível: membro", size_hint=(1, None), height=dp(44),
-                                    disabled=(self.nivel != "nexus"))
-        self.content_box.add_widget(btn_nivel)
-
-        def abrir_nivel(*_):
-            items = [{"text": nv, "on_release": lambda n=nv: selecionar(n)} for nv in niveis]
-            self._menu_nivel = MDDropdownMenu(caller=btn_nivel, items=items, width_mult=3)
-            self._menu_nivel.open()
-
-        def selecionar(n):
-            self._novo_u_nivel = n
-            btn_nivel.text = f"Nível: {n}"
-            self._menu_nivel.dismiss()
-
-        if self.nivel == "nexus":
-            btn_nivel.bind(on_release=abrir_nivel)
-
-        lbl_msg = MDLabel(text="", theme_text_color="Custom", text_color=(1, 0.42, 0.42, 1),
-                           size_hint_y=None, height=dp(26))
-        self.content_box.add_widget(lbl_msg)
-
-        def criar(*_):
-            nome = ent_nome.text.strip()
-            login = ent_login.text.strip().lower()
-            senha = ent_senha.text
-            if not nome or not login or not senha:
-                lbl_msg.text = "Preencha todos os campos."; return
-
-            def feito(r, err):
-                if err:
-                    lbl_msg.text = f"Erro (login duplicado?): {err}"; return
-                ent_nome.text = ent_login.text = ent_senha.text = ""
-                lbl_msg.text = ""
-                Snackbar(text=f"Usuário '{nome}' criado!").open()
-                self._recarregar_usuarios()
-
-            run_async(lambda: sb.table("usuarios").insert({
-                "nome": nome, "login": login, "senha": hash_senha(senha),
-                "nivel": self._novo_u_nivel, "grupo_id": self._novo_u_grupo_id,
-                "admin": self._novo_u_nivel in ["nexus", "adm"],
-            }).execute(), feito)
-
-        btn = MDRaisedButton(text="➕ Criar Usuário", size_hint=(1, None), height=dp(44), md_bg_color=COR_PRIMARIA)
-        btn.bind(on_release=criar)
-        self.content_box.add_widget(btn)
-
-    def _recarregar_usuarios(self):
-        self.usuarios_box.clear_widgets()
-
-        def consulta():
-            if self.nivel == "nexus":
-                return sb.table("usuarios").select("*, grupo:grupo_id(nome)").order("nome").execute().data
-            return sb.table("usuarios").select("*, grupo:grupo_id(nome)") \
-                     .eq("grupo_id", self.grupo["id"]).order("nome").execute().data
-
-        def feito(usuarios, err):
-            self.usuarios_box.clear_widgets()
-            if err or not usuarios:
-                self.usuarios_box.add_widget(MDLabel(text="Nenhum usuário." if not err else f"Erro: {err}",
-                                                       theme_text_color="Secondary", size_hint_y=None, height=dp(30)))
-                return
-            for u in usuarios:
-                icon = {"nexus": "👑", "adm": "🔧", "membro": "👤"}.get(u.get("nivel", "membro"), "👤")
-                gnome = u.get("grupo", {}).get("nome", "Sem grupo") if isinstance(u.get("grupo"), dict) else "Sem grupo"
-                row = MDBoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-                row.add_widget(MDLabel(text=f"{icon} {u['nome']} ({u['login']}) · {gnome}"))
-                if u["id"] != self.usuario["id"] and u.get("nivel") != "nexus":
-                    b = MDFlatButton(text="Excluir", md_bg_color=COR_PERIGO)
-                    b.bind(on_release=lambda *_, uid=u["id"]: self._excluir_usuario(uid))
-                    row.add_widget(b)
-                self.usuarios_box.add_widget(row)
-
-        run_async(consulta, feito)
-
-    def _excluir_usuario(self, uid):
-        def confirmar(*_):
-            self._dialog.dismiss()
-
-            def acao():
-                sb.table("tarefas").delete().eq("atribuido_a", uid).execute()
-                sb.table("tarefas").delete().eq("criado_por", uid).execute()
-                sb.table("notificacoes").delete().eq("usuario_id", uid).execute()
-                sb.table("usuarios").delete().eq("id", uid).execute()
-                return True
-
-            run_async(acao, lambda r, e: self._recarregar_usuarios())
-
-        self._dialog = MDDialog(
-            title="Confirmar",
-            text="Excluir este usuário? As tarefas e notificações associadas a ele também serão removidas.",
-            buttons=[
-                MDFlatButton(text="Cancelar", on_release=lambda *_: self._dialog.dismiss()),
-                MDFlatButton(text="Excluir", text_color=(1, 0.42, 0.42, 1), on_release=confirmar),
-            ],
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=401, detail="Sessão inválida, faça login de novo.")
+        return {"username": row["username"], "role": row["role"]}
+
+
+def require_admin(user: dict = Depends(user_from_token)) -> dict:
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Só o administrador pode fazer isso.")
+    return user
+
+
+# ---------------------------------------------------------------------------
+# Integração federada com o Nexus - login e vínculo de conta
+# ---------------------------------------------------------------------------
+
+def verify_nexus_login(username: str, password: str) -> dict | None:
+    """Verifica login/senha contra a tabela `usuarios` do Nexus, usando o
+    MESMO esquema de hash que o app Nexus usa (sha256 simples, sem salt -
+    é assim que o Nexus armazena hoje, não é a Kyky quem escolhe isso).
+    Devolve o registro do usuário do Nexus (com grupo, se houver) ou None
+    se não bater ou a integração estiver desativada."""
+    if not NEXUS_DATABASE_URL:
+        return None
+    senha_hash = hashlib.sha256(password.encode()).hexdigest()
+    with nexus_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT u.id, u.nome, u.login, u.nivel, u.grupo_id, g.nome AS grupo_nome "
+            "FROM usuarios u LEFT JOIN grupos g ON g.id = u.grupo_id "
+            "WHERE u.login = %s AND u.senha = %s",
+            (username, senha_hash),
         )
-        self._dialog.open()
+        return cur.fetchone()
 
-    # ── Teste de Notificação (Nexus apenas) ──────────────────────────
-    def view_teste(self):
-        self._titulo("🧪 Teste de Notificações")
-        self.content_box.add_widget(MDLabel(text="Toque num botão pra simular o tipo de notificação.",
-                                             theme_text_color="Secondary", size_hint_y=None, height=dp(30)))
-        lbl_status = MDLabel(text="", theme_text_color="Custom", text_color=(0.3, 0.73, 0.31, 1),
-                              size_hint_y=None, height=dp(30))
-        self.content_box.add_widget(lbl_status)
 
-        hoje_fmt = date.today().strftime("%d/%m/%Y")
-        testes = [
-            ("📋 Nova tarefa atribuída", "📋 Nova Tarefa Atribuída",
-             f"Fulano atribuiu a você: Revisar relatório mensal (prazo: {hoje_fmt} — Dia todo)"),
-            ("📋 Nova tarefa com horário", "📋 Nova Tarefa Atribuída",
-             f"Fulano atribuiu a você: Reunião de alinhamento (prazo: {hoje_fmt} às 14:30)"),
-            ("⏰ Lembrete de horário", "⏰ Tarefa no horário agora!",
-             "Sua tarefa 'Reunião de alinhamento' está programada para 14:30 hoje."),
-            ("⚠️ Tarefa vencida (sua)", "⚠️ Tarefa Vencida",
-             "Sua tarefa 'Enviar proposta ao cliente' venceu e ainda não foi concluída."),
-            ("⚠️ Membro com tarefa atrasada", "⚠️ Membro com Tarefa Atrasada",
-             "Estefani está com a tarefa 'Fechar planilha de custos' atrasada."),
-            ("✅ Tarefa concluída por membro", "✅ Tarefa Concluída",
-             "Estefani concluiu: Fechar planilha de custos."),
-            ("✅ Tarefa concluída — visão ADM", "✅ Tarefa Concluída (ADM)",
-             "Victor concluiu: Revisar relatório mensal. Notificação recebida como ADM do grupo."),
-        ]
-
-        def disparar(nome_btn, titulo_n, msg_n):
-            criar_notificacao(self.usuario["id"], titulo_n, msg_n)
-            self.atualizar_badge(0)
-            lbl_status.text = f"✅ '{nome_btn}' disparada! Veja em Notificações."
-
-        for nome, titulo_n, msg_n in testes:
-            row = MDBoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
-            row.add_widget(MDLabel(text=nome))
-            b = MDFlatButton(text="▶ Testar")
-            b.bind(on_release=lambda *_, n=nome, t=titulo_n, m=msg_n: disparar(n, t, m))
-            row.add_widget(b)
-            self.content_box.add_widget(row)
-
-        def testar_popup(*_):
-            hoje = date.today().isoformat()
-
-            def acao():
-                sb.table("tarefas").insert({
-                    "titulo": "Tarefa de teste (pop-up)", "descricao": "Criada automaticamente pelo teste.",
-                    "criado_por": self.usuario["id"], "atribuido_a": self.usuario["id"],
-                    "data_prazo": hoje, "concluida": False, "horario": None,
-                }).execute()
-                return sb.table("tarefas").select("*, criador:criado_por(nome)") \
-                         .eq("atribuido_a", self.usuario["id"]).eq("concluida", False) \
-                         .lte("data_prazo", hoje).execute().data
-
-            def feito(pendentes, err):
-                if err:
-                    lbl_status.text = f"Erro: {err}"; return
-                lbl_status.text = "✅ Tarefa criada. Abrindo pop-up..."
-                self.popup_pendentes(pendentes)
-
-            run_async(acao, feito)
-
-        row = MDBoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
-        row.add_widget(MDLabel(text="🚀 Criar tarefa para HOJE e testar pop-up"))
-        b = MDFlatButton(text="▶ Testar")
-        b.bind(on_release=testar_popup)
-        row.add_widget(b)
-        self.content_box.add_widget(row)
-
-    # ── Pop-up de pendentes (ao abrir o app) ─────────────────────────
-    def popup_pendentes(self, tarefas_extras=None):
-        if tarefas_extras is not None:
-            self._mostrar_popup(tarefas_extras)
-            return
-
-        def consulta():
-            hoje = date.today().isoformat()
-            return sb.table("tarefas").select("*, criador:criado_por(nome)") \
-                     .eq("atribuido_a", self.usuario["id"]).eq("concluida", False) \
-                     .lte("data_prazo", hoje).order("data_prazo").execute().data
-
-        run_async(consulta, lambda pendentes, err: None if err else self._mostrar_popup(pendentes))
-
-    def _mostrar_popup(self, pendentes):
-        if not pendentes:
-            return
-        notif_local("📋 Nexus", f"Você tem {len(pendentes)} tarefa(s) pendente(s) hoje!")
-
-        box = MDBoxLayout(orientation="vertical", spacing=dp(8), size_hint_y=None, padding=dp(4))
-        box.bind(minimum_height=box.setter("height"))
-        for t in pendentes:
-            criador = t.get("criador", {}).get("nome", "—") if isinstance(t.get("criador"), dict) else "—"
-            horario = t.get("horario", "")
-            h_txt = f"🕐 {str(horario)[:5]}" if horario else "🗓 Dia todo"
-            item_box = MDBoxLayout(orientation="vertical", size_hint_y=None, height=dp(54))
-            item_box.add_widget(MDLabel(text=t["titulo"], bold=True, size_hint_y=None, height=dp(24)))
-            item_box.add_widget(MDLabel(text=f"📅 {t['data_prazo']}  {h_txt}  ✏️ De: {criador}",
-                                         theme_text_color="Custom", text_color=(1, 0.42, 0.42, 1),
-                                         font_style="Caption", size_hint_y=None, height=dp(22)))
-            box.add_widget(item_box)
-
-        scroll = MDScrollView(size_hint_y=None, height=dp(280))
-        scroll.add_widget(box)
-
-        dialog = MDDialog(
-            title="🔔 Tarefas Pendentes / Vencidas",
-            type="custom",
-            content_cls=scroll,
-            buttons=[MDFlatButton(text="Entendido", on_release=lambda *_: dialog.dismiss())],
+def save_nexus_link(username_kyky: str, nexus_user: dict) -> None:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO nexus_links (username_kyky, nexus_usuario_id, nivel, grupo_id, grupo_nome, linked_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (username_kyky) DO UPDATE
+            SET nexus_usuario_id = EXCLUDED.nexus_usuario_id,
+                nivel = EXCLUDED.nivel,
+                grupo_id = EXCLUDED.grupo_id,
+                grupo_nome = EXCLUDED.grupo_nome
+            """,
+            (
+                username_kyky,
+                str(nexus_user["id"]),
+                nexus_user["nivel"],
+                str(nexus_user["grupo_id"]) if nexus_user.get("grupo_id") else None,
+                nexus_user.get("grupo_nome"),
+                now_iso(),
+            ),
         )
-        dialog.open()
-
-    # ── Verificador de horários (a cada 60s) ─────────────────────────
-    def checar_horarios(self, dt):
-        def consulta():
-            agora = datetime.now()
-            hoje = agora.date().isoformat()
-            h_atual = agora.strftime("%H:%M")
-            res = sb.table("tarefas").select("*, responsavel:atribuido_a(id,nome)") \
-                    .eq("atribuido_a", self.usuario["id"]).eq("concluida", False) \
-                    .eq("data_prazo", hoje).not_.is_("horario", "null").execute()
-            return res.data, h_atual
-
-        def feito(resultado, err):
-            if err or not resultado:
-                return
-            tarefas, h_atual = resultado
-            for t in tarefas:
-                h_tarefa = str(t.get("horario", ""))[:5]
-                if h_tarefa == h_atual:
-                    criar_notificacao(self.usuario["id"], f"⏰ Tarefa no horário: {t['titulo']}",
-                                       f"Esta tarefa está programada para {h_tarefa} hoje.")
-
-        run_async(consulta, feito)
 
 
+def load_nexus_link(username_kyky: str) -> dict | None:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT nexus_usuario_id, nivel, grupo_id, grupo_nome FROM nexus_links WHERE username_kyky = %s",
+            (username_kyky,),
+        )
+        return cur.fetchone()
 
 
+def login_com_federacao_nexus(username: str, password: str) -> tuple[str, dict | None]:
+    """Tenta o login local normal da Kyky primeiro. Se a conta local não
+    existir, tenta validar contra o Nexus e, se bater, provisiona a conta
+    local automaticamente (role definido pelo nível do Nexus - só
+    nivel="nexus" vira admin da Kyky). Devolve (role, nexus_link_ou_None)."""
+    if local_user_exists(username):
+        role = verify_login(username, password)
+        return role, load_nexus_link(username)
+
+    nexus_user = verify_nexus_login(username, password)
+    if nexus_user is None:
+        # nem existe local nem bate no Nexus -> credenciais inválidas mesmo
+        raise HTTPException(status_code=401, detail="Usuário ou senha inválidos.")
+
+    forced_role = "admin" if nexus_user["nivel"] == "nexus" else "user"
+    create_user(username, password, forced_role=forced_role)
+    save_nexus_link(username, nexus_user)
+    return forced_role, load_nexus_link(username)
 
 
-# ════════════════════════════════════════════════════════════════════
-# APP
-# ════════════════════════════════════════════════════════════════════
-class NexusApp(MDApp):
-    def build(self):
-        self.title = "Nexus"
-        self.theme_cls.theme_style = "Dark"
-        self.theme_cls.primary_palette = "Blue"
-        Window.softinput_mode = "below_target"  # teclado não cobre os campos
+# ---------------------------------------------------------------------------
+# Sessões (metadados: título, timestamps)
+# ---------------------------------------------------------------------------
 
-        self.sm = ScreenManager(transition=SlideTransition())
-        self.login_screen = LoginScreen()
-        self.main_screen = MainScreen()
-        self.sm.add_widget(self.login_screen)
-        self.sm.add_widget(self.main_screen)
-        return self.sm
+def touch_session(username: str, session_id: str, first_message: str | None, msg_count: int) -> None:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM sessions WHERE session_id = %s", (session_id,))
+        exists = cur.fetchone() is not None
+        ts = now_iso()
+        if not exists:
+            title = (first_message or "Nova conversa").strip().replace("\n", " ")
+            title = (title[:42] + "…") if len(title) > 42 else title
+            cur.execute(
+                "INSERT INTO sessions (session_id, username, title, message_count, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (session_id, username, title or "Nova conversa", msg_count, ts, ts),
+            )
+        else:
+            cur.execute(
+                "UPDATE sessions SET message_count = %s, updated_at = %s WHERE session_id = %s",
+                (msg_count, ts, session_id),
+            )
 
-    def entrar(self, usuario):
-        self.main_screen.set_usuario(usuario)
-        self.sm.current = "main"
 
-    def sair(self):
-        self.sm.current = "login"
+def list_sessions(username: str) -> list:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT session_id, title, message_count, created_at, updated_at "
+            "FROM sessions WHERE username = %s ORDER BY updated_at DESC",
+            (username,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def rename_session(username: str, session_id: str, title: str) -> None:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE sessions SET title = %s WHERE session_id = %s AND username = %s",
+            (title[:80], session_id, username),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Conversa não encontrada.")
+
+
+def delete_session_row(username: str, session_id: str) -> None:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM sessions WHERE session_id = %s AND username = %s",
+            (session_id, username),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Memória de conversa (tabela memories, uma linha por usuário+sessão)
+# ---------------------------------------------------------------------------
+
+def load_history(username: str, session_id: str) -> list:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT history FROM memories WHERE username = %s AND session_id = %s",
+            (username, session_id),
+        )
+        row = cur.fetchone()
+        return row["history"] if row else []
+
+
+def save_history(username: str, session_id: str, history: list) -> None:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO memories (username, session_id, history)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (username, session_id)
+            DO UPDATE SET history = EXCLUDED.history
+            """,
+            (username, session_id, json.dumps(history, ensure_ascii=False)),
+        )
+
+
+def delete_history(username: str, session_id: str) -> None:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM memories WHERE username = %s AND session_id = %s",
+            (username, session_id),
+        )
+
+
+def build_system_prompt(user: dict, cfg: dict, nexus_link: dict | None) -> str:
+    base = BASE_PERSONALITY_TEMPLATE.format(ai_name=cfg["ai_name"])
+    if cfg.get("personality_notes"):
+        base += f"\nNotas de personalidade adicionadas por autoedição/admin:\n{cfg['personality_notes']}\n"
+    if user["role"] == "admin":
+        base += ADMIN_ADDENDUM
+    else:
+        base += USER_ADDENDUM.format(username=user["username"])
+    if nexus_link:
+        grupo_txt = f", do grupo \"{nexus_link['grupo_nome']}\"" if nexus_link.get("grupo_nome") else ""
+        base += NEXUS_LINK_ADDENDUM.format(
+            username=user["username"], nivel=nexus_link["nivel"], grupo_txt=grupo_txt
+        )
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Ferramentas (function calling) - autoedição segura + sugestões de código +
+# controle do PC físico + integração com o Nexus. As de autoedição/PC só são
+# oferecidas quando quem fala é a administradora; as nexus_* são oferecidas
+# pra qualquer usuário com um vínculo (nexus_links) salvo, respeitando o
+# escopo do nível dele lá.
+# ---------------------------------------------------------------------------
+
+ADMIN_TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "atualizar_personalidade",
+            "description": (
+                "Atualiza o próprio nome ou as notas de personalidade/tom/contexto "
+                "guardadas em configuração. NÃO altera regras de segurança, que são "
+                "fixas. Use só quando a administradora pedir isso claramente."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "campo": {
+                        "type": "string",
+                        "enum": ["nome", "notas"],
+                        "description": "'nome' para trocar o próprio nome, 'notas' para "
+                        "substituir o bloco de notas de personalidade (tom, preferências, "
+                        "contexto extra).",
+                    },
+                    "valor": {
+                        "type": "string",
+                        "description": "Novo valor para o campo escolhido.",
+                    },
+                },
+                "required": ["campo", "valor"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sugerir_codigo",
+            "description": (
+                "Cria uma sugestão de código pendente para uma nova funcionalidade "
+                "do próprio sistema Kyky. NÃO aplica nem executa nada - só fica "
+                "salva para a administradora revisar no painel."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "titulo": {"type": "string", "description": "Título curto da sugestão."},
+                    "descricao": {
+                        "type": "string",
+                        "description": "Explicação do que o código faz e por quê.",
+                    },
+                    "codigo": {"type": "string", "description": "O trecho de código sugerido."},
+                    "arquivo": {
+                        "type": "string",
+                        "description": "Nome do arquivo onde isso provavelmente se encaixa (ex: main.py).",
+                    },
+                },
+                "required": ["titulo", "descricao", "codigo"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "testar_codigo",
+            "description": (
+                "Executa um trecho de código Python num ambiente isolado NO SERVIDOR "
+                "(nuvem), com timeout, para você mesma validar se funciona antes de "
+                "salvar como sugestão. Não tem acesso a GROQ_API_KEY, DATABASE_URL nem "
+                "NEXUS_DATABASE_URL, e é interrompido automaticamente após alguns "
+                "segundos. Diferente de controlar_pc/executar_codigo, isso NÃO roda no "
+                "PC físico da Kyo."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "codigo": {"type": "string", "description": "O código Python a executar."},
+                },
+                "required": ["codigo"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ler_codigo_fonte",
+            "description": (
+                "Lê o conteúdo de um arquivo do próprio projeto Kyky (ex: main.py, "
+                "static/index.html) para você entender como o sistema funciona antes "
+                "de sugerir ou testar mudanças. Só lê arquivos dentro da pasta do "
+                "projeto; não tem acesso a nada fora dela, nem a segredos/variáveis "
+                "de ambiente. Arquivos grandes vêm truncados."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "caminho": {
+                        "type": "string",
+                        "description": (
+                            "Caminho relativo do arquivo dentro do projeto, ex: "
+                            "'main.py' ou 'static/index.html'."
+                        ),
+                    },
+                },
+                "required": ["caminho"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "controlar_pc",
+            "description": (
+                "Enfileira uma ação pra ser executada no computador FÍSICO da "
+                "administradora pelo Agente Local (um programa rodando na máquina "
+                "dela, com voz e hotkey). Ações seguras (abrir programa/arquivo/url, "
+                "listar/ler/criar/pesquisar arquivos, executar código Python real, "
+                "status do sistema, travar tela, mudo) rodam na hora sem perguntar "
+                "nada. Ações sensíveis (deletar, sobrescrever, mover, instalar, "
+                "desligar/reiniciar, comando de terminal livre) SEMPRE pedem "
+                "confirmação num popup na tela física da Kyo antes de rodar - avise "
+                "a ela quando usar uma dessas. O comando fica pendente até o Agente "
+                "Local buscar e executar (pode levar alguns segundos, por causa do "
+                "polling)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "acao": {
+                        "type": "string",
+                        "enum": sorted(LOCAL_AGENT_ALLOWED_ACTIONS.keys()),
+                        "description": "Qual ação executar (ver allowlist de seguras/sensíveis).",
+                    },
+                    "argumento": {
+                        "type": "string",
+                        "description": (
+                            "Argumento da ação. Pra ações simples é uma string direta "
+                            "(ex: nome do programa, caminho, url, código). Pra ações "
+                            "que precisam de mais de um campo (criar_arquivo, "
+                            "sobrescrever_arquivo, mover_arquivo) é uma string JSON, "
+                            "ex: '{\"caminho\": \"C:/x.txt\", \"conteudo\": \"...\"}'. "
+                            "Deixe vazio se a ação não precisar de argumento."
+                        ),
+                    },
+                },
+                "required": ["acao"],
+            },
+        },
+    },
+]
+
+# Ferramentas do Nexus - liberadas pra qualquer usuário com vínculo salvo em
+# nexus_links, independente de ser admin da Kyky ou não. O escopo real
+# (o que ela pode ver/alterar) é sempre decidido em execute_tool_call com
+# base no nível/grupo do vínculo, nunca confiando só no que o modelo pediu.
+NEXUS_TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "nexus_listar_tarefas",
+            "description": (
+                "Lista tarefas do Nexus (app de tarefas em equipe) dentro do escopo "
+                "de permissão da pessoa: membro comum só vê as tarefas atribuídas a "
+                "ele mesmo; admin de equipe vê as do grupo dele; nível 'nexus' vê "
+                "todas. Use pra responder perguntas tipo 'o que eu tenho pendente' "
+                "ou 'quais tarefas estão atrasadas'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["pendentes", "concluidas", "todas"],
+                        "description": "Filtro de status. Padrão: pendentes.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "nexus_criar_tarefa",
+            "description": (
+                "Cria uma nova tarefa no Nexus, atribuída a alguém. Membro comum só "
+                "pode criar tarefa pra si mesmo; admin de equipe pode atribuir a "
+                "qualquer pessoa do próprio grupo; nível 'nexus' pode atribuir a "
+                "qualquer pessoa. Dispara notificação pro responsável automaticamente, "
+                "igual o app Nexus já faz quando alguém cria por lá."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "titulo": {"type": "string", "description": "Título da tarefa."},
+                    "descricao": {"type": "string", "description": "Descrição (opcional)."},
+                    "responsavel_login": {
+                        "type": "string",
+                        "description": (
+                            "Login do Nexus da pessoa responsável. Se vazio, assume a "
+                            "própria pessoa que está falando com você."
+                        ),
+                    },
+                    "data_prazo": {
+                        "type": "string",
+                        "description": "Data no formato YYYY-MM-DD.",
+                    },
+                    "horario": {
+                        "type": "string",
+                        "description": "Horário HH:MM, ou vazio para 'dia todo'.",
+                    },
+                },
+                "required": ["titulo", "data_prazo"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "nexus_concluir_tarefa",
+            "description": (
+                "Marca uma tarefa do Nexus como concluída, pelo título (busca "
+                "aproximada dentro do escopo permitido) ou pelo id exato."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "titulo_ou_id": {
+                        "type": "string",
+                        "description": "Título (ou parte dele) ou id da tarefa a concluir.",
+                    },
+                },
+                "required": ["titulo_ou_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "nexus_resumo_pendencias",
+            "description": (
+                "Monta um resumo rápido (em texto corrido, bom pra ler em voz alta) "
+                "das tarefas pendentes e vencidas de hoje, dentro do escopo da "
+                "pessoa. Use quando ela pedir um resumo do dia ou 'o que eu tenho pra "
+                "fazer hoje'."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+]
+
+
+def tools_for_user(user: dict, nexus_link: dict | None) -> list | None:
+    tools = []
+    if user["role"] == "admin":
+        tools += ADMIN_TOOLS_SCHEMA
+    if nexus_link:
+        tools += NEXUS_TOOLS_SCHEMA
+    return tools or None
+
+
+# --- implementação das ferramentas nexus_* ----------------------------------
+
+def _nexus_escopo_tarefas(cur, nexus_link: dict):
+    """Devolve uma cláusula SQL (string) + params que restringem a consulta
+    de tarefas ao escopo do nível da pessoa. Nunca confia em nada vindo do
+    modelo - o escopo é sempre derivado do nexus_link salvo no banco."""
+    nivel = nexus_link["nivel"]
+    if nivel == "nexus":
+        return "TRUE", []
+    if nivel == "adm" and nexus_link.get("grupo_id"):
+        cur.execute("SELECT id FROM usuarios WHERE grupo_id = %s", (nexus_link["grupo_id"],))
+        ids = [str(r["id"]) for r in cur.fetchall()]
+        if not ids:
+            return "FALSE", []
+        return "t.atribuido_a::text = ANY(%s)", [ids]
+    # membro comum (ou adm sem grupo) só vê o que é dele mesmo
+    return "t.atribuido_a::text = %s", [nexus_link["nexus_usuario_id"]]
+
+
+def nexus_tool_listar_tarefas(nexus_link: dict, status: str = "pendentes") -> str:
+    with nexus_db() as conn:
+        cur = conn.cursor()
+        escopo_sql, escopo_params = _nexus_escopo_tarefas(cur, nexus_link)
+        filtro_status = ""
+        if status == "pendentes":
+            filtro_status = "AND t.concluida = FALSE"
+        elif status == "concluidas":
+            filtro_status = "AND t.concluida = TRUE"
+        cur.execute(
+            f"""
+            SELECT t.titulo, t.data_prazo, t.horario, t.concluida, r.nome AS responsavel
+            FROM tarefas t
+            LEFT JOIN usuarios r ON r.id = t.atribuido_a
+            WHERE {escopo_sql} {filtro_status}
+            ORDER BY t.data_prazo ASC
+            LIMIT 30
+            """,
+            escopo_params,
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return "Nenhuma tarefa encontrada nesse filtro."
+    linhas = []
+    for r in rows:
+        h = f" às {str(r['horario'])[:5]}" if r["horario"] else " (dia todo)"
+        marca = "✅" if r["concluida"] else "⏳"
+        linhas.append(f"{marca} {r['titulo']} — {r['data_prazo']}{h} — responsável: {r['responsavel']}")
+    return "\n".join(linhas)
+
+
+def nexus_tool_criar_tarefa(
+    nexus_link: dict, titulo: str, data_prazo: str, descricao: str = "",
+    responsavel_login: str = "", horario: str = "",
+) -> str:
+    with nexus_db() as conn:
+        cur = conn.cursor()
+        nivel = nexus_link["nivel"]
+
+        if responsavel_login:
+            cur.execute("SELECT id, nome, grupo_id FROM usuarios WHERE login = %s", (responsavel_login,))
+            alvo = cur.fetchone()
+            if not alvo:
+                return f"Não encontrei nenhum usuário do Nexus com login '{responsavel_login}'."
+        else:
+            cur.execute("SELECT id, nome, grupo_id FROM usuarios WHERE id = %s", (nexus_link["nexus_usuario_id"],))
+            alvo = cur.fetchone()
+
+        # trava de escopo: membro só cria pra si mesmo; adm só dentro do
+        # próprio grupo; nexus pode qualquer um.
+        if nivel == "membro" and str(alvo["id"]) != str(nexus_link["nexus_usuario_id"]):
+            return "Você só tem permissão pra criar tarefas pra você mesma(o) no Nexus."
+        if nivel == "adm" and str(alvo.get("grupo_id")) != str(nexus_link.get("grupo_id")):
+            return "Você só tem permissão pra criar tarefas pra pessoas do seu próprio grupo no Nexus."
+
+        horario_sql = f"{horario}:00" if horario else None
+        cur.execute(
+            """
+            INSERT INTO tarefas (titulo, descricao, criado_por, atribuido_a, data_prazo, horario, concluida)
+            VALUES (%s, %s, %s, %s, %s, %s, FALSE)
+            RETURNING id
+            """,
+            (titulo, descricao, nexus_link["nexus_usuario_id"], alvo["id"], data_prazo, horario_sql),
+        )
+        nova_id = cur.fetchone()["id"]
+
+        if str(alvo["id"]) != str(nexus_link["nexus_usuario_id"]):
+            h_info = f" às {horario}" if horario else " (dia todo)"
+            cur.execute(
+                "INSERT INTO notificacoes (usuario_id, titulo, mensagem, lida) VALUES (%s, %s, %s, FALSE)",
+                (
+                    alvo["id"],
+                    "📋 Nova Tarefa Atribuída",
+                    f"Você recebeu (via Kyky): {titulo} — {data_prazo}{h_info}",
+                ),
+            )
+    return f"Tarefa '{titulo}' criada para {alvo['nome']} em {data_prazo}."
+
+
+def nexus_tool_concluir_tarefa(nexus_link: dict, titulo_ou_id: str) -> str:
+    with nexus_db() as conn:
+        cur = conn.cursor()
+        escopo_sql, escopo_params = _nexus_escopo_tarefas(cur, nexus_link)
+        cur.execute(
+            f"""
+            SELECT t.id, t.titulo FROM tarefas t
+            WHERE {escopo_sql} AND t.concluida = FALSE
+            AND (t.id::text = %s OR t.titulo ILIKE %s)
+            ORDER BY t.data_prazo ASC
+            LIMIT 1
+            """,
+            escopo_params + [titulo_ou_id, f"%{titulo_ou_id}%"],
+        )
+        alvo = cur.fetchone()
+        if not alvo:
+            return "Não encontrei nenhuma tarefa pendente com esse título/id dentro do que você tem permissão de ver."
+        cur.execute("UPDATE tarefas SET concluida = TRUE WHERE id = %s", (alvo["id"],))
+    return f"Tarefa '{alvo['titulo']}' marcada como concluída."
+
+
+def nexus_tool_resumo_pendencias(nexus_link: dict) -> str:
+    with nexus_db() as conn:
+        cur = conn.cursor()
+        escopo_sql, escopo_params = _nexus_escopo_tarefas(cur, nexus_link)
+        hoje = datetime.now(timezone.utc).date().isoformat()
+        cur.execute(
+            f"""
+            SELECT t.titulo, t.data_prazo, t.horario, r.nome AS responsavel
+            FROM tarefas t
+            LEFT JOIN usuarios r ON r.id = t.atribuido_a
+            WHERE {escopo_sql} AND t.concluida = FALSE AND t.data_prazo <= %s
+            ORDER BY t.data_prazo ASC
+            LIMIT 20
+            """,
+            escopo_params + [hoje],
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return "Nenhuma pendência hoje ou atrasada dentro do que você pode ver. Tudo em dia!"
+    vencidas = [r for r in rows if r["data_prazo"] < hoje]
+    de_hoje = [r for r in rows if r["data_prazo"] == hoje]
+    partes = []
+    if vencidas:
+        partes.append(f"{len(vencidas)} tarefa(s) vencida(s): " + "; ".join(v["titulo"] for v in vencidas))
+    if de_hoje:
+        partes.append(f"{len(de_hoje)} tarefa(s) pra hoje: " + "; ".join(v["titulo"] for v in de_hoje))
+    return " | ".join(partes)
+
+
+def execute_tool_call(name: str, args: dict, user: dict, cfg: dict, nexus_link: dict | None) -> tuple[dict, str]:
+    """Executa a ferramenta e retorna (config_atualizado, texto_resultado)."""
+    if name == "atualizar_personalidade":
+        campo = args.get("campo")
+        valor = (args.get("valor") or "").strip()
+        if campo == "nome" and valor:
+            cfg["ai_name"] = valor[:40]
+            save_config(cfg)
+            return cfg, f"Nome atualizado para '{cfg['ai_name']}'."
+        elif campo == "notas":
+            cfg["personality_notes"] = valor[:2000]
+            save_config(cfg)
+            return cfg, "Notas de personalidade atualizadas."
+        return cfg, "Campo inválido, nada foi alterado."
+
+    if name == "sugerir_codigo":
+        sug_id = str(uuid.uuid4())
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO suggestions (id, username, title, description, code, file_hint, status, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, 'pendente', %s)",
+                (
+                    sug_id,
+                    user["username"],
+                    (args.get("titulo") or "Sugestão sem título")[:120],
+                    args.get("descricao") or "",
+                    args.get("codigo") or "",
+                    args.get("arquivo") or "",
+                    now_iso(),
+                ),
+            )
+        return cfg, "Sugestão de código salva no painel de admin para revisão."
+
+    if name == "testar_codigo":
+        codigo = args.get("codigo") or ""
+        if not codigo.strip():
+            return cfg, "Nenhum código fornecido para testar."
+        result = run_sandbox_code(codigo)
+        resumo = (
+            f"Saída (exit code {result['exit_code']}, {result['duration_seconds']}s):\n"
+            f"stdout:\n{result['stdout'] or '(vazio)'}\n\n"
+            f"stderr:\n{result['stderr'] or '(vazio)'}"
+        )
+        if result["timed_out"]:
+            resumo = f"⏱️ Tempo esgotado ({SANDBOX_TIMEOUT_SECONDS}s).\n" + resumo
+        return cfg, resumo
+
+    if name == "ler_codigo_fonte":
+        caminho = args.get("caminho") or ""
+        return cfg, read_source_file(caminho)
+
+    if name == "controlar_pc":
+        acao = args.get("acao")
+        argumento = (args.get("argumento") or "").strip()
+        if acao not in LOCAL_AGENT_ALLOWED_ACTIONS:
+            return cfg, f"Ação '{acao}' não está na allowlist permitida, nada foi enfileirado."
+        cmd_id = enqueue_local_command(user["username"], acao, argumento)
+        sensitive = acao in LOCAL_AGENT_SENSITIVE_ACTIONS
+        aviso_confirmacao = (
+            " ⚠️ Essa é uma ação sensível - vai aparecer um popup de confirmação "
+            "na tela física da Kyo, e ela precisa confirmar por lá."
+            if sensitive
+            else ""
+        )
+        return cfg, (
+            f"Comando '{acao}' enfileirado (id {cmd_id}) para o Agente Local."
+            f"{aviso_confirmacao} Ele será executado assim que o agente fizer o "
+            "próximo polling - pode levar alguns segundos."
+        )
+
+    # --- ferramentas do Nexus - todas exigem vínculo salvo ---
+    if name.startswith("nexus_"):
+        if not nexus_link:
+            return cfg, "Essa pessoa não está vinculada ao Nexus, não é possível usar essa ferramenta."
+        if name == "nexus_listar_tarefas":
+            return cfg, nexus_tool_listar_tarefas(nexus_link, args.get("status", "pendentes"))
+        if name == "nexus_criar_tarefa":
+            return cfg, nexus_tool_criar_tarefa(
+                nexus_link,
+                titulo=args.get("titulo", ""),
+                data_prazo=args.get("data_prazo", ""),
+                descricao=args.get("descricao", ""),
+                responsavel_login=args.get("responsavel_login", ""),
+                horario=args.get("horario", ""),
+            )
+        if name == "nexus_concluir_tarefa":
+            return cfg, nexus_tool_concluir_tarefa(nexus_link, args.get("titulo_ou_id", ""))
+        if name == "nexus_resumo_pendencias":
+            return cfg, nexus_tool_resumo_pendencias(nexus_link)
+
+    return cfg, "Ferramenta desconhecida."
+
+
+# ---------------------------------------------------------------------------
+# Agente Local - fila de comandos (tabela local_commands no Postgres)
+# ---------------------------------------------------------------------------
+
+def enqueue_local_command(username: str, action: str, argument: str) -> str:
+    cmd_id = str(uuid.uuid4())
+    sensitive = action in LOCAL_AGENT_SENSITIVE_ACTIONS
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO local_commands (id, username, action, argument, status, sensitive, created_at) "
+            "VALUES (%s, %s, %s, %s, 'pendente', %s, %s)",
+            (cmd_id, username, action, argument, sensitive, now_iso()),
+        )
+    return cmd_id
+
+
+def require_local_agent(authorization: str | None = Header(default=None)) -> None:
+    """Autenticação separada do login de usuário, usada só pelo Agente Local.
+    Compara com secrets.compare_digest pra evitar timing attack no token."""
+    if not LOCAL_AGENT_TOKEN:
+        raise HTTPException(status_code=500, detail="LOCAL_AGENT_TOKEN não configurado no servidor.")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Agente não autenticado.")
+    token = authorization.removeprefix("Bearer ").strip()
+    if not secrets.compare_digest(token, LOCAL_AGENT_TOKEN):
+        raise HTTPException(status_code=401, detail="Token do agente inválido.")
+
+
+def read_source_file(relative_path: str) -> str:
+    """Lê um arquivo dentro de BASE_DIR com travas rígidas de segurança:
+    - resolve o caminho e confirma que continua DENTRO de BASE_DIR (impede
+      '../' ou caminhos absolutos escapando da pasta do projeto);
+    - só permite extensões de texto/código conhecidas (nunca .env, .db etc.);
+    - nunca lê o próprio arquivo de configuração de segredos;
+    - trunca a saída para não estourar o contexto da API."""
+    if not relative_path or not relative_path.strip():
+        return "Nenhum caminho de arquivo foi informado."
+
+    raw = relative_path.strip().lstrip("/\\")
+    if ".." in Path(raw).parts:
+        return "Acesso negado: caminhos com '..' não são permitidos."
+
+    candidate = (BASE_DIR / raw).resolve()
+
+    try:
+        candidate.relative_to(BASE_DIR.resolve())
+    except ValueError:
+        return "Acesso negado: esse caminho está fora da pasta do projeto."
+
+    blocked_names = {".env", ".env.local", "kyky.db"}
+    if candidate.name in blocked_names or candidate.name.startswith("."):
+        return "Acesso negado: este arquivo é reservado e não pode ser lido."
+
+    if not candidate.exists() or not candidate.is_file():
+        return f"Arquivo não encontrado: {raw}"
+
+    if candidate.suffix.lower() not in CODE_READ_ALLOWED_EXTENSIONS:
+        return f"Tipo de arquivo não permitido para leitura: {candidate.suffix or '(sem extensão)'}"
+
+    try:
+        content = candidate.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return f"Erro ao ler o arquivo: {e}"
+
+    truncated = len(content) > CODE_READ_MAX_CHARS
+    content = content[:CODE_READ_MAX_CHARS]
+    header = f"Arquivo: {raw} ({len(content)} caracteres{' , truncado' if truncated else ''})\n\n"
+    return header + content
+
+
+class GroqRateLimitError(RuntimeError):
+    """Levantada quando a Groq responde 429 e as tentativas automáticas
+    (GROQ_MAX_RETRIES) já se esgotaram - dá pro chamador decidir cair pra um
+    modelo de fallback em vez de simplesmente falhar."""
+
+
+def call_groq(messages: list, model: str, tools: list | None = None) -> dict:
+    payload = {"model": model, "messages": messages}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+        payload["max_tokens"] = MAX_TOKENS_WITH_TOOLS
+
+    attempt = 0
+    while True:
+        resp = requests.post(
+            GROQ_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            json=payload,
+            timeout=60,
+        )
+        if resp.ok:
+            return resp.json()
+
+        if resp.status_code == 429 and attempt < GROQ_MAX_RETRIES:
+            wait_seconds = 3.0
+            match = re.search(r"try again in ([\d.]+)s", resp.text)
+            if match:
+                wait_seconds = float(match.group(1)) + 0.5
+            time.sleep(min(wait_seconds, 20))
+            attempt += 1
+            continue
+
+        if resp.status_code == 429:
+            raise GroqRateLimitError(f"Groq {resp.status_code}: {resp.text}")
+
+        raise RuntimeError(f"Groq {resp.status_code}: {resp.text}")
+
+
+# ---------------------------------------------------------------------------
+# Sandbox — execução isolada de código Python (NO SERVIDOR), com timeout e
+# sem segredos. Diferente da execução real no PC físico via Agente Local.
+# ---------------------------------------------------------------------------
+
+def run_sandbox_code(code: str, timeout: int = SANDBOX_TIMEOUT_SECONDS) -> dict:
+    restricted_env = {
+        k: v for k, v in os.environ.items()
+        if k not in {"GROQ_API_KEY", "DATABASE_URL", "NEXUS_DATABASE_URL", "LOCAL_AGENT_TOKEN"}
+    }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        script_path = Path(tmp_dir) / "sandbox_script.py"
+        script_path.write_text(code, encoding="utf-8")
+
+        start = datetime.now(timezone.utc)
+        try:
+            result = subprocess.run(
+                [sys.executable, str(script_path)],
+                cwd=tmp_dir,
+                env=restricted_env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            duration = (datetime.now(timezone.utc) - start).total_seconds()
+            return {
+                "stdout": result.stdout[:SANDBOX_OUTPUT_LIMIT],
+                "stderr": result.stderr[:SANDBOX_OUTPUT_LIMIT],
+                "exit_code": result.returncode,
+                "timed_out": False,
+                "duration_seconds": round(duration, 2),
+            }
+        except subprocess.TimeoutExpired as e:
+            return {
+                "stdout": (e.stdout or "")[:SANDBOX_OUTPUT_LIMIT],
+                "stderr": (e.stderr or "") + f"\n[Execução interrompida: passou de {timeout}s]",
+                "exit_code": None,
+                "timed_out": True,
+                "duration_seconds": timeout,
+            }
+        except Exception as e:
+            return {
+                "stdout": "",
+                "stderr": f"Erro ao executar sandbox: {e}",
+                "exit_code": None,
+                "timed_out": False,
+                "duration_seconds": 0,
+            }
+
+
+# ---------------------------------------------------------------------------
+# Áudio - transcrição via Groq Whisper (mesma API que o Agente Local usa)
+# ---------------------------------------------------------------------------
+
+def transcribe_audio_groq(raw: bytes, filename: str, content_type: str) -> str:
+    """Manda o áudio pra Groq (Whisper) e devolve o texto transcrito."""
+    resp = requests.post(
+        GROQ_TRANSCRIBE_URL,
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+        files={"file": (filename or "audio.webm", raw, content_type or "audio/webm")},
+        data={"model": WHISPER_MODEL, "language": "pt"},
+        timeout=60,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Groq Whisper {resp.status_code}: {resp.text}")
+    return (resp.json().get("text") or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Imagens - redimensiona/recomprime pra caber no limite de 4MB em base64
+# que a Groq exige pro modelo de visão (qwen/qwen3.6-27b)
+# ---------------------------------------------------------------------------
+
+def shrink_image_for_groq(raw: bytes, content_type: str) -> tuple[bytes, str]:
+    """Reduz resolução/qualidade da imagem até o base64 caber no limite da
+    Groq. Sem isso, fotos de celular (comuns entre 3-10MB) causam erro 413
+    silencioso na hora de conversar, mesmo com o /upload em si funcionando.
+    Se o Pillow não estiver disponível, devolve a imagem original (a Groq
+    pode recusar se for grande demais)."""
+    try:
+        from PIL import Image
+        import io
+
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        quality = 85
+        max_dimension = 1600
+        for _ in range(12):
+            resized = img.copy()
+            resized.thumbnail((max_dimension, max_dimension))
+            buf = io.BytesIO()
+            resized.save(buf, format="JPEG", quality=quality)
+            data = buf.getvalue()
+            estimated_base64_size = len(data) * 4 / 3
+            if estimated_base64_size < MAX_IMAGE_BASE64_BYTES:
+                return data, "image/jpeg"
+            if quality > 40:
+                quality -= 15
+            else:
+                max_dimension = int(max_dimension * 0.75)
+        return data, "image/jpeg"  # melhor esforço, mesmo que ainda grande
+    except Exception:
+        return raw, content_type
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title=DEFAULT_AI_NAME)
+
+if not GROQ_API_KEY:
+    print(
+        "[AVISO] GROQ_API_KEY não definida. Pegue uma chave grátis em "
+        "console.groq.com e configure antes de conversar."
+    )
+if not DATABASE_URL:
+    print(
+        "[AVISO] DATABASE_URL não definida. Configure a connection string "
+        "do Supabase antes de rodar, ou nada será salvo."
+    )
+if not LOCAL_AGENT_TOKEN:
+    print(
+        "[AVISO] LOCAL_AGENT_TOKEN não definida. O Agente Local (voz/controle "
+        "do PC físico) não vai conseguir se autenticar até você configurar "
+        "essa variável (aqui E no .env do agente_local.py, com o MESMO valor)."
+    )
+if NEXUS_DATABASE_URL:
+    print("[INFO] NEXUS_DATABASE_URL configurada - integração federada com o Nexus ativa.")
+else:
+    print(
+        "[INFO] NEXUS_DATABASE_URL não definida - login federado e ferramentas "
+        "nexus_* ficam desativados (resto da Kyky funciona normalmente)."
+    )
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class AuthResponse(BaseModel):
+    token: str
+    username: str
+    role: str
+
+
+@app.post("/register", response_model=AuthResponse)
+def register(req: RegisterRequest):
+    username = req.username.strip()
+    if len(username) < 3 or len(req.password) < 6:
+        raise HTTPException(
+            status_code=400,
+            detail="Usuário precisa de 3+ caracteres e senha de 6+ caracteres.",
+        )
+    role = create_user(username, req.password)
+    token = issue_token(username)
+    return AuthResponse(token=token, username=username, role=role)
+
+
+@app.post("/login", response_model=AuthResponse)
+def login(req: LoginRequest):
+    username = req.username.strip()
+    role, _ = login_com_federacao_nexus(username, req.password)
+    token = issue_token(username)
+    return AuthResponse(token=token, username=username, role=role)
+
+
+@app.get("/me")
+def me(user: dict = Depends(user_from_token)):
+    return user
+
+
+@app.get("/config/public")
+def config_public():
+    cfg = load_config()
+    return {"ai_name": cfg["ai_name"], "icon_url": cfg["icon_url"]}
+
+
+# --- chat -------------------------------------------------------------------
+
+class Attachment(BaseModel):
+    type: str
+    name: str
+    data_url: str | None = None
+    extracted_text: str | None = None
+
+
+class ChatRequest(BaseModel):
+    session_id: str | None = None
+    message: str
+    attachments: list[Attachment] = []
+    source: str | None = None  # "web" | "voz" | "mobile" - só informativo por enquanto
+
+
+class ChatResponse(BaseModel):
+    session_id: str
+    reply: str
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest, user: dict = Depends(user_from_token)):
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY não configurada no servidor.")
+
+    cfg = load_config()
+    session_id = req.session_id or str(uuid.uuid4())
+    history = load_history(user["username"], session_id)
+    nexus_link = load_nexus_link(user["username"]) if NEXUS_DATABASE_URL else None
+
+    text_content = req.message
+    image_parts = []
+    for att in req.attachments:
+        if att.type == "image" and att.data_url:
+            image_parts.append({"type": "image_url", "image_url": {"url": att.data_url}})
+        elif att.type == "texto" and att.extracted_text:
+            trecho = att.extracted_text[:6000]
+            text_content += f"\n\n[Conteúdo do arquivo enviado '{att.name}']:\n{trecho}"
+        elif att.type == "audio" and att.extracted_text:
+            text_content += f"\n\n[Transcrição do áudio enviado '{att.name}']:\n{att.extracted_text[:4000]}"
+
+    if image_parts:
+        user_content = [{"type": "text", "text": text_content or "O que você vê aqui?"}] + image_parts
+        model_to_use = VISION_MODEL
+    else:
+        user_content = text_content
+        model_to_use = cfg.get("model", MODEL)
+
+    history.append({
+        "role": "user",
+        "content": user_content,
+        "attachments": [a.model_dump() for a in req.attachments],
+    })
+
+    system_prompt = build_system_prompt(user, cfg, nexus_link)
+    groq_messages = [{"role": "system", "content": system_prompt}]
+    recent_history = history[-MAX_HISTORY_MESSAGES_SENT:]
+    for h in recent_history:
+        content = h["content"]
+        if content is None:
+            content = ""
+        groq_messages.append({"role": h["role"], "content": content})
+
+    tools = tools_for_user(user, nexus_link)
+
+    used_fallback = False
+
+    def call_with_fallback(msgs: list) -> dict:
+        nonlocal model_to_use, used_fallback
+        try:
+            return call_groq(msgs, model_to_use, tools)
+        except GroqRateLimitError:
+            if model_to_use == FALLBACK_MODEL or image_parts:
+                raise
+            model_to_use = FALLBACK_MODEL
+            used_fallback = True
+            return call_groq(msgs, model_to_use, tools)
+
+    try:
+        data = call_with_fallback(groq_messages)
+        msg = data["choices"][0]["message"]
+
+        rounds = 0
+        while msg.get("tool_calls") and rounds < 3:
+            safe_msg = dict(msg)
+            if safe_msg.get("content") is None:
+                safe_msg["content"] = ""
+            groq_messages.append(safe_msg)
+
+            for call in msg["tool_calls"]:
+                fn_name = call["function"]["name"]
+                try:
+                    fn_args = json.loads(call["function"]["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    groq_messages.append({
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": (
+                            "Erro: os argumentos enviados para esta ferramenta não "
+                            "vieram em JSON válido (provavelmente o conteúdo era "
+                            "grande demais e foi cortado). Tente de novo com um "
+                            "trecho de código menor, ou divida a sugestão em partes."
+                        ),
+                    })
+                    continue
+                cfg, result_text = execute_tool_call(fn_name, fn_args, user, cfg, nexus_link)
+                groq_messages.append({
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "content": result_text,
+                })
+            data = call_with_fallback(groq_messages)
+            msg = data["choices"][0]["message"]
+            rounds += 1
+
+        reply_text = msg.get("content") or "(sem resposta de texto)"
+        if used_fallback:
+            reply_text += (
+                "\n\n_(usei um modelo mais leve por causa de limite de uso "
+                "no momento - a resposta pode ser um pouco menos refinada)_"
+            )
+    except (requests.exceptions.RequestException, RuntimeError) as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao falar com o Groq: {e}")
+
+    history.append({"role": "assistant", "content": reply_text, "attachments": []})
+    save_history(user["username"], session_id, history)
+    touch_session(user["username"], session_id, req.message, len(history))
+
+    return ChatResponse(session_id=session_id, reply=reply_text)
+
+
+# --- upload de arquivos -------------------------------------------------
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...), user: dict = Depends(user_from_token)):
+    content_type = file.content_type or ""
+    raw = await file.read()
+    max_bytes = 15 * 1024 * 1024
+    if len(raw) > max_bytes:
+        raise HTTPException(status_code=400, detail="Arquivo maior que 15MB.")
+
+    if content_type.startswith("image/"):
+        raw, content_type = shrink_image_for_groq(raw, content_type)
+        b64 = base64.b64encode(raw).decode("utf-8")
+        return {
+            "type": "image",
+            "name": file.filename,
+            "data_url": f"data:{content_type};base64,{b64}",
+        }
+
+    if content_type.startswith("audio/") or (file.filename or "").lower().endswith(AUDIO_EXTENSIONS):
+        if len(raw) > MAX_AUDIO_BYTES:
+            raise HTTPException(status_code=400, detail="Áudio maior que 20MB.")
+        try:
+            texto = transcribe_audio_groq(raw, file.filename or "audio.webm", content_type or "audio/webm")
+        except RuntimeError as e:
+            raise HTTPException(status_code=400, detail=f"Não consegui transcrever o áudio: {e}")
+        b64 = base64.b64encode(raw).decode("utf-8")
+        return {
+            "type": "audio",
+            "name": file.filename or "audio.webm",
+            "data_url": f"data:{content_type or 'audio/webm'};base64,{b64}",
+            "extracted_text": texto or "(áudio sem fala reconhecível)",
+        }
+
+    if content_type == "application/pdf" or (file.filename or "").lower().endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+            import io
+
+            reader = PdfReader(io.BytesIO(raw))
+            text = "\n".join((page.extract_text() or "") for page in reader.pages)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Não consegui ler o PDF: {e}")
+        return {"type": "texto", "name": file.filename, "extracted_text": text}
+
+    if content_type.startswith("text/") or (file.filename or "").lower().endswith((".txt", ".md", ".csv", ".log")):
+        try:
+            text = raw.decode("utf-8", errors="replace")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Não consegui ler o arquivo: {e}")
+        return {"type": "texto", "name": file.filename, "extracted_text": text}
+
+    raise HTTPException(
+        status_code=400,
+        detail="Tipo de arquivo não suportado (use imagem, PDF ou texto).",
+    )
+
+
+# --- sessões / histórico -------------------------------------------------
+
+@app.get("/sessions")
+def get_sessions(user: dict = Depends(user_from_token)):
+    return list_sessions(user["username"])
+
+
+class RenameRequest(BaseModel):
+    title: str
+
+
+@app.patch("/sessions/{session_id}")
+def patch_session(session_id: str, req: RenameRequest, user: dict = Depends(user_from_token)):
+    title = req.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Título não pode ser vazio.")
+    rename_session(user["username"], session_id, title)
+    return {"status": "renomeado"}
+
+
+@app.get("/history/{session_id}")
+def get_history(session_id: str, user: dict = Depends(user_from_token)):
+    return {"session_id": session_id, "history": load_history(user["username"], session_id)}
+
+
+@app.delete("/history/{session_id}")
+def clear_history(session_id: str, user: dict = Depends(user_from_token)):
+    delete_history(user["username"], session_id)
+    delete_session_row(user["username"], session_id)
+    return {"status": "limpo"}
+
+
+# --- rotas exclusivas de administrador -------------------------------------
+
+@app.get("/admin/users")
+def admin_list_users(_: dict = Depends(require_admin)):
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT username, role, created_at FROM users")
+        return [dict(r) for r in cur.fetchall()]
+
+
+@app.delete("/admin/users/{username}")
+def admin_delete_user(username: str, admin: dict = Depends(require_admin)):
+    if username == admin["username"]:
+        raise HTTPException(status_code=400, detail="Você não pode remover a si mesmo.")
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM users WHERE username = %s", (username,))
+        cur.execute("DELETE FROM tokens WHERE username = %s", (username,))
+        cur.execute("DELETE FROM sessions WHERE username = %s", (username,))
+        cur.execute("DELETE FROM memories WHERE username = %s", (username,))
+        cur.execute("DELETE FROM nexus_links WHERE username_kyky = %s", (username,))
+    return {"status": "removido"}
+
+
+@app.get("/admin/stats")
+def admin_stats(_: dict = Depends(require_admin)):
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) AS c FROM users")
+        total_users = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) AS c FROM sessions")
+        total_sessions = cur.fetchone()["c"]
+        cur.execute("SELECT COALESCE(SUM(message_count), 0) AS c FROM sessions")
+        total_messages = cur.fetchone()["c"]
+
+        now = datetime.now(timezone.utc)
+        cutoff_24h = (now - timedelta(hours=24)).isoformat()
+        cutoff_7d = (now - timedelta(days=7)).isoformat()
+
+        cur.execute(
+            "SELECT COUNT(DISTINCT username) AS c FROM sessions WHERE updated_at >= %s",
+            (cutoff_24h,),
+        )
+        active_24h = cur.fetchone()["c"]
+        cur.execute(
+            "SELECT COUNT(DISTINCT username) AS c FROM sessions WHERE updated_at >= %s",
+            (cutoff_7d,),
+        )
+        active_7d = cur.fetchone()["c"]
+
+        cur.execute(
+            "SELECT substr(CAST(updated_at AS TEXT), 1, 10) AS day, COALESCE(SUM(message_count),0) AS c "
+            "FROM sessions GROUP BY day ORDER BY day DESC LIMIT 14"
+        )
+        rows = cur.fetchall()
+        by_day = [{"day": r["day"], "messages": r["c"]} for r in reversed(rows)]
+
+        cur.execute("SELECT COUNT(*) AS c FROM suggestions WHERE status = 'pendente'")
+        pending_suggestions = cur.fetchone()["c"]
+
+        cur.execute("SELECT COUNT(*) AS c FROM nexus_links")
+        nexus_linked_users = cur.fetchone()["c"]
+
+        return {
+            "total_users": total_users,
+            "total_sessions": total_sessions,
+            "total_messages": total_messages,
+            "active_24h": active_24h,
+            "active_7d": active_7d,
+            "messages_by_day": by_day,
+            "pending_suggestions": pending_suggestions,
+            "nexus_linked_users": nexus_linked_users,
+        }
+
+
+class ConfigUpdateRequest(BaseModel):
+    ai_name: str | None = None
+    personality_notes: str | None = None
+    model: str | None = None
+
+
+@app.get("/admin/config")
+def admin_get_config(_: dict = Depends(require_admin)):
+    return load_config()
+
+
+@app.post("/admin/config")
+def admin_update_config(req: ConfigUpdateRequest, _: dict = Depends(require_admin)):
+    cfg = load_config()
+    if req.ai_name is not None and req.ai_name.strip():
+        cfg["ai_name"] = req.ai_name.strip()[:40]
+    if req.personality_notes is not None:
+        cfg["personality_notes"] = req.personality_notes.strip()[:2000]
+    if req.model is not None and req.model.strip():
+        cfg["model"] = req.model.strip()
+    save_config(cfg)
+    return cfg
+
+
+@app.post("/admin/config/reset")
+def admin_reset_config(_: dict = Depends(require_admin)):
+    cfg = dict(DEFAULT_CONFIG)
+    existing = load_config()
+    cfg["icon_url"] = existing.get("icon_url", DEFAULT_CONFIG["icon_url"])
+    save_config(cfg)
+    return cfg
+
+
+@app.post("/admin/icon")
+async def admin_upload_icon(file: UploadFile = File(...), _: dict = Depends(require_admin)):
+    content_type = file.content_type or ""
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Envie um arquivo de imagem.")
+    raw = await file.read()
+    if len(raw) > 3 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Ícone deve ter menos de 3MB.")
+
+    ext = ".png"
+    if "svg" in content_type:
+        ext = ".svg"
+    elif "jpeg" in content_type or "jpg" in content_type:
+        ext = ".jpg"
+    elif "webp" in content_type:
+        ext = ".webp"
+
+    icon_path = STATIC_DIR / f"icon{ext}"
+    icon_path.write_bytes(raw)
+
+    cfg = load_config()
+    cfg["icon_url"] = f"/static/icon{ext}?v={int(datetime.now().timestamp())}"
+    save_config(cfg)
+    return cfg
+
+
+@app.get("/admin/suggestions")
+def admin_list_suggestions(_: dict = Depends(require_admin)):
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM suggestions ORDER BY created_at DESC")
+        return [dict(r) for r in cur.fetchall()]
+
+
+class SuggestionStatusRequest(BaseModel):
+    status: str
+
+
+@app.post("/admin/suggestions/{sug_id}/status")
+def admin_set_suggestion_status(
+    sug_id: str, req: SuggestionStatusRequest, _: dict = Depends(require_admin)
+):
+    if req.status not in ("pendente", "aprovada", "rejeitada"):
+        raise HTTPException(status_code=400, detail="Status inválido.")
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE suggestions SET status = %s WHERE id = %s", (req.status, sug_id)
+        )
+    return {"status": "ok"}
+
+
+@app.delete("/admin/suggestions/{sug_id}")
+def admin_delete_suggestion(sug_id: str, _: dict = Depends(require_admin)):
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM suggestions WHERE id = %s", (sug_id,))
+    return {"status": "removido"}
+
+
+class SandboxRunRequest(BaseModel):
+    code: str | None = None
+    suggestion_id: str | None = None
+
+
+@app.post("/admin/sandbox/run")
+def admin_run_sandbox(req: SandboxRunRequest, _: dict = Depends(require_admin)):
+    code = req.code
+    if not code and req.suggestion_id:
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT code FROM suggestions WHERE id = %s", (req.suggestion_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Sugestão não encontrada.")
+            code = row["code"]
+    if not code or not code.strip():
+        raise HTTPException(status_code=400, detail="Nenhum código para executar.")
+    return run_sandbox_code(code)
+
+
+class LocalCommandResult(BaseModel):
+    status: str  # 'concluido', 'falhou' ou 'recusado' (usuário negou a confirmação)
+    result: str
+
+
+@app.get("/agent/commands/pending")
+def agent_pending_commands(_: None = Depends(require_local_agent)):
+    """Chamado pelo Agente Local via polling (não pelo navegador/admin).
+    Inclui a flag 'sensitive' pra o agente decidir se mostra o popup de
+    confirmação antes de executar."""
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, action, argument, sensitive FROM local_commands "
+            "WHERE status = 'pendente' ORDER BY created_at ASC LIMIT 5"
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+@app.post("/agent/commands/{cmd_id}/result")
+def agent_report_result(cmd_id: str, req: LocalCommandResult, _: None = Depends(require_local_agent)):
+    """O Agente Local chama isso depois de executar (ou recusar/tentar)."""
+    if req.status not in ("concluido", "falhou", "recusado"):
+        raise HTTPException(status_code=400, detail="Status inválido.")
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE local_commands SET status = %s, result = %s, completed_at = %s WHERE id = %s",
+            (req.status, req.result[:2000], now_iso(), cmd_id),
+        )
+    return {"status": "ok"}
+
+
+@app.get("/admin/local/commands")
+def admin_list_local_commands(_: dict = Depends(require_admin)):
+    """Pro painel admin acompanhar o histórico de comandos enviados ao PC."""
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, username, action, argument, sensitive, status, result, created_at, completed_at "
+            "FROM local_commands ORDER BY created_at DESC LIMIT 100"
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+@app.get("/admin/nexus/links")
+def admin_list_nexus_links(_: dict = Depends(require_admin)):
+    """Pro painel admin ver quem já está vinculado ao Nexus e com qual nível."""
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT username_kyky, nexus_usuario_id, nivel, grupo_nome, linked_at "
+            "FROM nexus_links ORDER BY linked_at DESC"
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Interface web
+# ---------------------------------------------------------------------------
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/")
+def index():
+    return FileResponse(STATIC_DIR / "index.html")
 
 
 if __name__ == "__main__":
-    NexusApp().run()
+    import uvicorn
+
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
